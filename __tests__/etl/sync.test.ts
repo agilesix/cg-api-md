@@ -45,6 +45,9 @@ class FakeRepo implements IOppRepo {
   async allHashesBySourceId() {
     return new Map([...this.rows.values()].map((r) => [r.sourceId, r.contentHash]));
   }
+  async deleteBySourceIds(sourceIds: string[]) {
+    for (const sourceId of sourceIds) this.rows.delete(sourceId);
+  }
   async getLastSyncedAt() {
     const last = this.syncLogs.at(-1);
     return last?.stats?.completedAt ?? null;
@@ -263,6 +266,46 @@ describe('runSync', () => {
     await expect(runSync(deps)).rejects.toThrow('upstream fetch failed');
     expect(repo.syncLogs).toHaveLength(1);
     expect(repo.syncLogs[0]?.stats?.errorMessage).toBe('upstream fetch failed');
+  });
+
+  it('removes persisted rows missing from a successful full source scan', async () => {
+    const { deps, repo } = buildDeps(sources);
+    deps.reconcileMissing = true;
+    await runSync(deps);
+
+    sources.splice(1, 1);
+    await runSync(deps);
+
+    expect(repo.rows.has('s2')).toBe(false);
+    expect([...repo.rows.keys()]).toEqual(['s1', 's3']);
+  });
+
+  it('refuses to erase existing rows when a reconciliation scan is unexpectedly empty', async () => {
+    const { deps, repo } = buildDeps(sources);
+    deps.reconcileMissing = true;
+    await runSync(deps);
+
+    sources.splice(0);
+    await expect(runSync(deps)).rejects.toThrow('Refusing to reconcile an empty source scan');
+    expect(repo.rows.size).toBe(3);
+  });
+
+  it('does not reconcile partial results when the source scan fails', async () => {
+    const { deps, repo } = buildDeps(sources);
+    deps.reconcileMissing = true;
+    await runSync(deps);
+    deps.client = {
+      async getGrant() {
+        return null;
+      },
+      async *listAll() {
+        yield sources[0] as FakeSource;
+        throw new Error('page failed');
+      },
+    };
+
+    await expect(runSync(deps)).rejects.toThrow('page failed');
+    expect(repo.rows.size).toBe(3);
   });
 });
 

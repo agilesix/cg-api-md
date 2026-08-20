@@ -240,6 +240,16 @@ export class SqliteOppRepo implements IOppRepo {
     return new Map(rows.map((r) => [r.source_id, r.content_hash]));
   }
 
+  async deleteBySourceIds(sourceIds: string[]): Promise<void> {
+    const BATCH = 90;
+    for (let i = 0; i < sourceIds.length; i += BATCH) {
+      await this.db
+        .deleteFrom('opportunities')
+        .where('source_id', 'in', sourceIds.slice(i, i + BATCH))
+        .execute();
+    }
+  }
+
   async getLastSyncedAt(): Promise<string | null> {
     const row = await this.db
       .selectFrom('sync_log')

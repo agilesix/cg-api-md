@@ -2,79 +2,38 @@ import { v5 as uuidv5 } from 'uuid';
 import type { MdGrant } from './mdSource';
 import type { MdOpportunityInput } from './plugin';
 
-/**
- * Pure mapping logic between raw Maryland grant records (CKAN DataStore) and
- * the CommonGrants `Opportunity` shape. No I/O, no DB, no Workers types, and —
- * importantly — **no schema dependency**: validation lives in the plugin's
- * `toCommon` / `fromCommon` wrappers (`./plugin`), which fold any Zod issues
- * into the SDK's `TransformResult.errors`. Keeping this module schema-free
- * avoids a circular import (`plugin` → `transform` for the builders;
- * `transform` → `plugin` only for the input *type*, erased at runtime).
- */
-
-/** Element type of `MdOpportunityInput.keyDates.otherDates`. */
-type OtherDateInput = NonNullable<
-  NonNullable<MdOpportunityInput['keyDates']>['otherDates']
->[string];
-
-/** Element type of `MdOpportunityInput.customFields`. */
-type CustomFieldInput = NonNullable<MdOpportunityInput['customFields']>[string];
-
-/** A parsed CG `Money`-shaped value. */
+type CustomField = NonNullable<MdOpportunityInput['customFields']>[string];
+type ApplicantType = NonNullable<MdOpportunityInput['acceptedApplicantTypes']>[number];
 type Money = { amount: string; currency: 'USD' };
 
-// =============================================================================
-// UUID v5 namespace
-// =============================================================================
+const MD_NAMESPACE = uuidv5('md.compass.commongrants.api', uuidv5.DNS);
+const COMPASS_BASE = 'https://compass.maryland.gov/incentives/';
 
-/**
- * Deterministic namespace for MD CommonGrants UUIDs. Derived once from the DNS
- * namespace + `"ca.commongrants.api"` so it is stable forever without a
- * hardcoded magic UUID literal. A given MD `PortalID` always maps to the same
- * CG id.
- */
-const MD_NAMESPACE = uuidv5('md.commongrants.api', uuidv5.DNS);
-
-/** Map a MD portal id to a deterministic CommonGrants UUID. */
-export function portalIdToCgId(portalId: string): string {
-  return uuidv5(portalId, MD_NAMESPACE);
+export function slugToCgId(slug: string): string {
+  return uuidv5(slug, MD_NAMESPACE);
 }
 
-// =============================================================================
-// Primitive normalization helpers
-// =============================================================================
+/** Backward-compatible export retained for callers of the scaffold. */
+export const portalIdToCgId = slugToCgId;
 
-/** Trim + treat `""` as `null`. */
-export function nullIfEmpty(s: string | null | undefined): string | null {
-  if (s == null) return null;
-  const trimmed = s.trim();
-  return trimmed === '' ? null : trimmed;
+export function nullIfEmpty(value: string | null | undefined): string | null {
+  const trimmed = value?.trim() ?? '';
+  return trimmed || null;
 }
 
-/**
- * Like `nullIfEmpty`, but additionally returns null when the value isn't a
- * parseable absolute URL. Use for fields the CommonGrants schema validates
- * with `.url()` (e.g. `Opportunity.source`) so free-form values like `"TBD"`
- * don't slip through and break downstream Zod parsing.
- */
-export function nullIfNotUrl(s: string | null): string | null {
-  if (!s) return null;
+export function nullIfNotUrl(value: string | null): string | null {
+  if (!value) return null;
   try {
-    new URL(s);
-    return s;
+    const url = new URL(value);
+    return url.protocol === 'http:' || url.protocol === 'https:' ? value : null;
   } catch {
     return null;
   }
 }
 
-/**
- * Best-effort strip of HTML tags. MD's `Description` / `Purpose` occasionally
- * carry simple markup; this produces clean plain text. Not a security
- * sanitizer — do not rely on it for XSS protection.
- */
-export function stripHtml(s: string | null): string | null {
-  if (!s) return null;
-  const plain = s
+export function stripHtml(value: string | null): string | null {
+  if (!value) return null;
+  const plain = value
     .replace(/<br\s*\/?>/gi, '\n')
     .replace(/<\/p>/gi, '\n\n')
     .replace(/<[^>]+>/g, '')
@@ -87,683 +46,375 @@ export function stripHtml(s: string | null): string | null {
     .replace(/[ \t]+/g, ' ')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
-  return plain === '' ? null : plain;
+  return plain || null;
 }
 
-/** Split a MD `;`-delimited list column into a trimmed, non-empty array. */
-export function splitList(s: string | null): string[] {
-  if (!s) return [];
-  return s
-    .split(';')
-    .map((p) => p.trim())
-    .filter((p) => p.length > 0);
+export function splitList(value: string | null): string[] {
+  return (
+    value
+      ?.split(';')
+      .map((part) => part.trim())
+      .filter(Boolean) ?? []
+  );
 }
 
-// =============================================================================
-// Financial parsing
-// =============================================================================
+const money = (amount: number): Money => ({ amount: amount.toFixed(2), currency: 'USD' });
 
-const money = (n: number): Money => ({ amount: n.toFixed(2), currency: 'USD' });
-
-/** Convert a parsed `Money` to integer cents. Null in, null out. */
-export function moneyToCents(m: { amount: string } | null | undefined): number | null {
-  if (!m) return null;
-  const dollars = Number(m.amount);
-  if (!Number.isFinite(dollars)) return null;
-  return Math.round(dollars * 100);
-}
-
-/**
- * Parse a single MD financial string into a `Money`, or null. Handles
- * `"$500,000"`, `"$2 million"`, `"500k"`, plain integers. Returns null for
- * empty/free-form values (`"Varies"`, `"Dependent on submissions"`).
- */
-export function parseFinancial(raw: string | null): Money | null {
-  if (!raw) return null;
-  const match = raw.match(/\$?\s*([\d][\d,]*(?:\.\d+)?)\s*(million|thousand|m|k)?/i);
+export function parseFinancial(value: string | null): Money | null {
+  if (!value) return null;
+  const match = value.match(/\$\s*([\d][\d,]*(?:\.\d+)?)\s*(million|thousand|m|k)?/i);
   if (!match) return null;
-  let n = Number((match[1] ?? '').replace(/,/g, ''));
-  if (!Number.isFinite(n) || n < 0) return null;
+  let amount = Number((match[1] ?? '').replace(/,/g, ''));
   const unit = (match[2] ?? '').toLowerCase();
-  if (unit.startsWith('m')) n *= 1_000_000;
-  else if (unit.startsWith('k') || unit.startsWith('thousand')) n *= 1_000;
-  return money(n);
+  if (unit === 'm' || unit === 'million') amount *= 1_000_000;
+  if (unit === 'k' || unit === 'thousand') amount *= 1_000;
+  return Number.isFinite(amount) ? money(amount) : null;
 }
 
-/**
- * Parse MD's free-form `EstAmounts` into a `{ min, max }` award range.
- *
- * Observed formats:
- *   - `"Between $5,000 and $375,000"` → min 5,000 / max 375,000
- *   - `"$5,000 - $375,000"` / `"$5,000 to $375,000"` → range
- *   - `"$50,000"` / `"Up to $100,000"` → single value → `max`
- *   - `"At least $10,000"` / `"Minimum $10,000"` → single value → `min`
- *   - `"Varies"`, `"Dependent on …"` → `{ null, null }`
- *
- * Requires a `$` so bare numbers in prose aren't mistaken for amounts. The raw
- * string is always preserved by the caller in `mdEstAmountsRaw`, so a missed
- * parse loses nothing.
- */
-export function parseAmountRange(raw: string | null): { min: Money | null; max: Money | null } {
-  if (!raw) return { min: null, max: null };
-  const matches = [...raw.matchAll(/\$\s*([\d][\d,]*(?:\.\d+)?)\s*(million|thousand|m|k)?/gi)];
-  const amounts = matches
-    .map((m) => {
-      let n = Number((m[1] ?? '').replace(/,/g, ''));
-      const unit = (m[2] ?? '').toLowerCase();
-      if (unit.startsWith('m')) n *= 1_000_000;
-      else if (unit.startsWith('k') || unit.startsWith('thousand')) n *= 1_000;
-      return n;
-    })
-    .filter((n) => Number.isFinite(n) && n >= 0);
-
-  if (amounts.length === 0) return { min: null, max: null };
-
-  const lo = Math.min(...amounts);
-  const hi = Math.max(...amounts);
-
-  if (amounts.length === 1) {
-    // A single amount: decide whether it's a floor or a ceiling from context.
-    if (/\b(min|minimum|at least|starting|no less than)\b/i.test(raw)) {
-      return { min: money(lo), max: null };
-    }
-    return { min: null, max: money(hi) };
-  }
-  return { min: money(lo), max: money(hi) };
-}
-
-// =============================================================================
-// Matching-funds parsing
-// =============================================================================
-
-/**
- * Parse MD's `MatchingFunds` column. Values are a percentage (`"35%"`,
- * `"0%"`, `"100%"`) or the literal `"Not Required"`.
- *
- * Returns `isRequired` plus the match `percentage` (0–100) for the standard
- * `costSharing` field. `"0%"` is treated as not required. Returns null for
- * empty/unrecognized input.
- */
-export function parseMatchingFunds(
-  raw: string | null,
-): { isRequired: boolean; percentage: number | null } | null {
-  const s = nullIfEmpty(raw);
-  if (s === null) return null;
-  if (/not\s*required/i.test(s)) return { isRequired: false, percentage: null };
-  const pct = s.match(/^(\d+(?:\.\d+)?)\s*%$/);
-  if (pct) {
-    const percentage = Number(pct[1]);
-    if (Number.isFinite(percentage) && percentage >= 0) {
-      return { isRequired: percentage > 0, percentage };
+export function parseAmountRange(value: string | null): { min: Money | null; max: Money | null } {
+  if (!value) return { min: null, max: null };
+  const amount = String.raw`\$\s*[\d][\d,]*(?:\.\d+)?\s*(?:million|thousand|m|k)?`;
+  const rangePatterns = [
+    new RegExp(
+      String.raw`\b(?:between|from)\s+(?:(?:a\s+)?(?:minimum|min\.?)\s+of\s+)?(${amount})\s+(?:and|to|through|-|–|—)\s*(?:(?:a\s+)?(?:maximum|max\.?)\s+of\s+)?(${amount})`,
+      'i',
+    ),
+    new RegExp(String.raw`(${amount})\s*(?:to|through|-|–|—)\s*(${amount})`, 'i'),
+  ];
+  for (const pattern of rangePatterns) {
+    const match = value.match(pattern);
+    const first = parseFinancial(match?.[1] ?? null);
+    const second = parseFinancial(match?.[2] ?? null);
+    if (first && second) {
+      const amounts = [Number(first.amount), Number(second.amount)];
+      return { min: money(Math.min(...amounts)), max: money(Math.max(...amounts)) };
     }
   }
-  return null;
+
+  const cap = value.match(
+    new RegExp(
+      String.raw`\b(?:up to|maximum(?:\s+award)?(?:\s+of)?|max\.?|not more than)\s*(?:an?\s+)?(${amount})`,
+      'i',
+    ),
+  );
+  const max = parseFinancial(cap?.[1] ?? null);
+  if (max) return { min: null, max };
+
+  const floor = value.match(
+    new RegExp(
+      String.raw`\b(?:at least|minimum(?:\s+award)?(?:\s+of)?|min\.?|starting at|not less than)\s*(?:an?\s+)?(${amount})`,
+      'i',
+    ),
+  );
+  const min = parseFinancial(floor?.[1] ?? null);
+  if (min) return { min, max: null };
+
+  return { min: null, max: null };
 }
 
-/** Inverse: a 0–100 percentage back to MD's `"NN%"` string. */
-function percentToMdPercent(percentage: unknown): string {
-  if (typeof percentage !== 'number' || !Number.isFinite(percentage)) return '';
-  return `${Math.round(percentage)}%`;
+export function moneyToCents(value: { amount: string } | null | undefined): number | null {
+  if (!value) return null;
+  const amount = Number(value.amount);
+  return Number.isFinite(amount) ? Math.round(amount * 100) : null;
 }
 
-// =============================================================================
-// Date / time handling
-// =============================================================================
-
-/**
- * Split a MD datetime (`"2026-06-22 17:20:00"`, timezone-naive) into the
- * `{ date, time }` pair the CG `SingleDateEventSchema` expects. Tolerates a
- * date-only value (`time` → null) and ISO-style `T` separators. Returns null
- * for empty/unparseable input.
- */
-export function splitMdDateTime(raw: string | null): { date: string; time: string | null } | null {
-  if (!raw) return null;
-  const match = raw.match(/^(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2}:\d{2})(?:\.\d+)?)?/);
-  if (!match) return null;
-  return { date: match[1] as string, time: match[2] ?? null };
-}
-
-/**
- * Convert a MD datetime into an ISO 8601 UTC string for the CG
- * `createdAt` / `lastModifiedAt` fields (which require a full datetime).
- *
- * MD timestamps carry no timezone; we treat them as UTC and append `Z`. This
- * is a deterministic, sortable normalization — the incremental-sync watermark
- * compares MD's *raw* `LastUpdated` string (not this value), so the UTC
- * assumption never affects change detection. Returns `""` when unparseable.
- */
-export function mdDateToIso(raw: string | null): string {
-  const parts = splitMdDateTime(raw);
-  if (!parts) return '';
-  return `${parts.date}T${parts.time ?? '00:00:00'}Z`;
-}
-
-// =============================================================================
-// Status mapping
-// =============================================================================
-
-const STATUS_MAP: Record<string, 'forecasted' | 'open' | 'closed'> = {
-  active: 'open',
-  closed: 'closed',
-  forecasted: 'forecasted',
-};
-
-/** Canonical MD label for each mapped CG status (used by `fromCommon`). */
-const STATUS_REVERSE_MAP: Record<'forecasted' | 'open' | 'closed', string> = {
-  open: 'active',
-  closed: 'closed',
-  forecasted: 'forecasted',
-};
-
-/**
- * Map MD's `Status` (`active` | `closed` | `forecasted`) to the CG `OppStatus`
- * enum. Unknown values fall back to `custom` with the original string in
- * `customValue`.
- */
-export function normalizeStatus(raw: string | null): {
+export function normalizeStatus(
+  grant: Pick<MdGrant, 'is_accepting_applications' | 'is_recurring' | 'application_deadline_date'>,
+): {
   value: 'forecasted' | 'open' | 'closed' | 'custom';
   customValue: string | null;
 } {
-  const norm = (raw ?? '').trim().toLowerCase();
-  const mapped = STATUS_MAP[norm];
-  if (mapped) return { value: mapped, customValue: null };
-  if (norm === '') return { value: 'custom', customValue: null };
-  return { value: 'custom', customValue: raw };
+  if (grant.is_accepting_applications) {
+    return { value: 'open', customValue: null };
+  }
+  if (grant.is_recurring) {
+    return { value: 'custom', customValue: 'Recurring' };
+  }
+  return { value: 'custom', customValue: 'Confirm with agency' };
 }
 
-/** Inverse of `normalizeStatus`. Lossy for mapped statuses (canonical label). */
-export function statusToMdString(status: {
-  value: 'forecasted' | 'open' | 'closed' | 'custom';
-  customValue?: string | null;
-}): string {
-  if (status.value === 'custom') return status.customValue ?? '';
-  return STATUS_REVERSE_MAP[status.value];
+export function statusToMdString(status: { value: string; customValue?: string | null }): string {
+  return status.value === 'custom' ? (status.customValue ?? '') : status.value;
 }
 
-// =============================================================================
-// Applicant-type mapping (native `acceptedApplicantTypes`)
-// =============================================================================
-
-/** Element type of the native `acceptedApplicantTypes` array. */
-type ApplicantTypeInput = NonNullable<MdOpportunityInput['acceptedApplicantTypes']>[number];
-type ApplicantTypeValue = ApplicantTypeInput['value'];
-
-/**
- * MD applicant-type label → CommonGrants `ApplicantTypeOptionsEnum`, for the
- * confident matches only. MD's labels are coarser than the standard enum
- * (e.g. "Business" doesn't say small-vs-large; "Nonprofit" doesn't say 501c3;
- * "Public Agency" doesn't say which level of government), so anything not
- * listed here is emitted as `custom` with the original label preserved.
- */
-const MD_APPLICANT_TYPE_MAP: Record<string, ApplicantTypeValue> = {
+const APPLICANT_MAP: Record<string, ApplicantType['value']> = {
+  individuals: 'individual',
   individual: 'individual',
-  'tribal government': 'government_tribal',
 };
 
-/** Reverse map for reconstructing MD labels from mapped enum values. */
-const MD_APPLICANT_TYPE_REVERSE: Partial<Record<ApplicantTypeValue, string>> = {
-  individual: 'Individual',
-  government_tribal: 'Tribal Government',
-};
-
-/**
- * Map MD's `;`-delimited `ApplicantType` list onto the native
- * `acceptedApplicantTypes` field. Confident matches use the standard enum;
- * everything else becomes `custom` with the original label in `customValue`,
- * so no information is lost.
- */
-export function mapApplicantTypes(raw: string | null): ApplicantTypeInput[] {
-  return splitList(raw).map((label) => {
-    const mapped = MD_APPLICANT_TYPE_MAP[label.toLowerCase()];
+export function mapApplicantTypes(values: string[]): ApplicantType[] {
+  return values.map((label) => {
+    const mapped = APPLICANT_MAP[label.toLowerCase()];
     return mapped
       ? { value: mapped, customValue: null, description: null }
       : { value: 'custom', customValue: label, description: null };
   });
 }
 
-/** Reverse of `mapApplicantTypes`: reconstruct MD's `;`-delimited string. */
-function applicantTypesToMdString(types: unknown): string {
-  if (!Array.isArray(types)) return '';
-  return types
-    .map((t) => {
-      const v = (t ?? {}) as { value?: unknown; customValue?: unknown };
-      if (v.value === 'custom') return typeof v.customValue === 'string' ? v.customValue : '';
-      return MD_APPLICANT_TYPE_REVERSE[v.value as ApplicantTypeValue] ?? String(v.value ?? '');
-    })
-    .filter((s) => s.length > 0)
-    .join('; ');
+export function parseMdContact(
+  grant: Pick<MdGrant, 'contact_name' | 'contact_email' | 'contact_phone'>,
+) {
+  const name = nullIfEmpty(grant.contact_name);
+  const email = nullIfEmpty(grant.contact_email);
+  const phone = nullIfEmpty(grant.contact_phone);
+  return name || email || phone ? { name, email, phone, description: null } : null;
 }
 
-// =============================================================================
-// Contact parsing
-// =============================================================================
-
-/**
- * Parse MD's structured `ContactInfo` string into a CG contact.
- *
- * Format: semicolon-delimited `key: value` pairs, e.g.
- *   `"name: Jane Doe; email: grants@example.gov; tel: 1-555-…;"`
- *
- * Recognizes `name`, `email`, and `tel`/`phone` keys (case-insensitive); any
- * unrecognized pairs are preserved in `description` so nothing is lost.
- */
-export function parseMdContact(raw: string | null): {
-  name: string | null;
-  email: string | null;
-  phone: string | null;
-  description: string | null;
-} | null {
-  const s = nullIfEmpty(raw);
-  if (s === null) return null;
-
-  let name: string | null = null;
-  let email: string | null = null;
-  let phone: string | null = null;
-  const extra: string[] = [];
-
-  for (const part of s.split(';')) {
-    const trimmed = part.trim();
-    if (!trimmed) continue;
-    const sep = trimmed.indexOf(':');
-    if (sep === -1) {
-      extra.push(trimmed);
-      continue;
-    }
-    const key = trimmed.slice(0, sep).trim().toLowerCase();
-    const value = trimmed.slice(sep + 1).trim();
-    if (!value) continue;
-    if (key === 'name' && name === null) name = value;
-    else if (key === 'email' && email === null) email = value;
-    else if ((key === 'tel' || key === 'phone' || key === 'telephone') && phone === null)
-      phone = value;
-    else extra.push(`${key}: ${value}`);
-  }
-
-  if (name === null && email === null && phone === null && extra.length === 0) return null;
-  return { name, email, phone, description: extra.length ? extra.join('; ') : null };
+function putString(fields: Record<string, CustomField>, name: string, value: string | null) {
+  if (value) fields[name] = { name, fieldType: 'string', value };
 }
 
-// =============================================================================
-// Core transform: MdGrant → MdOpportunity (input shape)
-// =============================================================================
+function putList(fields: Record<string, CustomField>, name: string, values: string[]) {
+  if (values.length) fields[name] = { name, fieldType: 'array', value: values };
+}
 
-/**
- * Convert a raw MD grant record into a CommonGrants `Opportunity` with MD
- * custom fields attached. Pure function — no I/O, no DB, no Workers types,
- * **no validation**.
- *
- * Returns the **input** shape (strings everywhere, no `Date` objects) so the
- * result serializes directly to JSON; the CG date schemas accept string input
- * and normalize to `Date` internally. Validation against the extended schema
- * is performed by the plugin's `toCommon` wrapper (see `./plugin`).
- *
- * `syncedAt` is the ISO timestamp of the current ETL run, stored in the
- * `mdLastSyncedAt` custom field.
- */
-export function mdGrantToOpportunity(ca: MdGrant, syncedAt: string): MdOpportunityInput {
-  const status = normalizeStatus(ca.Status);
+function toIso(value: string): string {
+  return new Date(value).toISOString();
+}
 
-  // Funding: parse the EstAmounts range + the EstAvailFunds total.
-  const { min: minAward, max: maxAward } = parseAmountRange(nullIfEmpty(ca.EstAmounts));
-  const totalAvailable = parseFinancial(nullIfEmpty(ca.EstAvailFunds));
-  const hasFunding = minAward !== null || maxAward !== null || totalAvailable !== null;
+function singleDate(name: string, date: string, details?: string | null) {
+  return { name, eventType: 'singleDate' as const, date, time: null, details: details ?? null };
+}
 
-  // Dates.
-  const openDateSplit = splitMdDateTime(nullIfEmpty(ca.OpenDate));
-  const closeDateSplit = splitMdDateTime(nullIfEmpty(ca.ApplicationDeadline));
-  const expAwardDate = nullIfEmpty(ca.ExpAwardDate);
-  const awardPeriod = nullIfEmpty(ca.AwardPeriod);
-
-  const otherDates: Record<string, OtherDateInput> = {};
-  if (expAwardDate) {
-    // ExpAwardDate is free-form ("November 2026") → an `other` event with details.
-    otherDates['expectedAwardDate'] = {
-      name: 'Expected Award Date',
-      eventType: 'other',
-      details: expAwardDate,
-    };
-  }
-  if (awardPeriod) {
-    // AwardPeriod is free-form ("Expires 3/31/29") → an `other` event.
-    otherDates['awardPeriod'] = {
-      name: 'Award Period',
-      eventType: 'other',
-      details: awardPeriod,
-    };
-  }
-
-  const hasKeyDates =
-    openDateSplit !== null || closeDateSplit !== null || Object.keys(otherDates).length > 0;
-
-  // Matching funds → the standard costSharing field (isRequired + percentage +
-  // details). MD's free-text MatchingFundsNotes folds into costSharing.details.
-  const matching = parseMatchingFunds(ca.MatchingFunds);
-  const matchingNotes = nullIfEmpty(ca.MatchingFundsNotes);
-
-  // Agency: MD exposes only a department name (no short code).
-  const agencyName = nullIfEmpty(ca.AgencyDept);
-  const agencyUrl = nullIfNotUrl(nullIfEmpty(ca.AgencyURL));
-
-  // Contact.
-  const contact = parseMdContact(ca.ContactInfo);
-
-  // Applicant eligibility → native `acceptedApplicantTypes`.
-  const acceptedApplicantTypes = mapApplicantTypes(nullIfEmpty(ca.ApplicantType));
-
-  // Description: prefer the long Description, fall back to the short Purpose.
-  const description =
-    stripHtml(nullIfEmpty(ca.Description)) ?? stripHtml(nullIfEmpty(ca.Purpose)) ?? '';
-
-  // ---- custom fields -----------------------------------------------------
-  const customFields: Record<string, CustomFieldInput> = {};
-  const putStr = (key: string, raw: string | null) => {
-    const v = nullIfEmpty(raw);
-    if (v !== null) customFields[key] = { name: key, fieldType: 'string', value: v };
-  };
-
-  // Always: the source key + sync timestamp.
-  customFields['mdPortalId'] = { name: 'mdPortalId', fieldType: 'string', value: ca.PortalID };
-
-  if (agencyName !== null) {
-    customFields['agency'] = {
+export function mdGrantToOpportunity(grant: MdGrant, syncedAt: string): MdOpportunityInput {
+  const fields: Record<string, CustomField> = {};
+  const agency = nullIfEmpty(grant.agency);
+  if (agency) {
+    fields.agency = {
       name: 'agency',
       fieldType: 'object',
-      value: { code: null, name: agencyName, parentName: null, parentCode: null },
+      value: { code: null, name: agency, parentName: null, parentCode: null },
     };
   }
+  const contact = parseMdContact(grant);
+  if (contact) fields.contactInfo = { name: 'contactInfo', fieldType: 'object', value: contact };
+  fields.additionalInfo = {
+    name: 'additionalInfo',
+    fieldType: 'object',
+    value: {
+      url: `${COMPASS_BASE}#/incentive/${grant.slug}`,
+      description: 'Maryland Community Compass record',
+    },
+  };
 
-  if (contact !== null) {
-    customFields['contactInfo'] = { name: 'contactInfo', fieldType: 'object', value: contact };
-  }
-
-  if (agencyUrl !== null) {
-    customFields['additionalInfo'] = {
-      name: 'additionalInfo',
-      fieldType: 'object',
-      value: { url: agencyUrl, description: 'Issuing agency homepage' },
-    };
-  }
-
-  if (matching !== null || matchingNotes !== null) {
-    customFields['costSharing'] = {
-      name: 'costSharing',
+  const eligibilityDetails = [grant.program_audience, grant.geographic_eligibility]
+    .map(nullIfEmpty)
+    .filter((value): value is string => value !== null)
+    .join('\n\n');
+  if (grant.eligible_organization_types.length || eligibilityDetails) {
+    fields.eligibilityCriteria = {
+      name: 'eligibilityCriteria',
       fieldType: 'object',
       value: {
-        isRequired: matching?.isRequired ?? null,
-        percentage: matching?.percentage ?? null,
-        details: matchingNotes,
+        beneficiaryTypes: grant.eligible_organization_types.map((name) => ({
+          code: name
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, '_')
+            .replace(/^_|_$/g, ''),
+          name,
+        })),
+        details: eligibilityDetails || null,
       },
     };
   }
+  const attachments = grant.attachment_urls
+    .filter((url) => nullIfNotUrl(url))
+    .map((downloadUrl) => ({
+      downloadUrl,
+      name: attachmentName(downloadUrl),
+      mimeType: null,
+    }));
+  if (attachments.length)
+    fields.attachments = { name: 'attachments', fieldType: 'array', value: attachments };
 
-  putStr('mdGrantId', ca.GrantID);
-  putStr('fundingInstrument', ca.Type);
-
-  const categories = splitList(nullIfEmpty(ca.Categories));
-  if (categories.length > 0) {
-    customFields['mdCategories'] = { name: 'mdCategories', fieldType: 'array', value: categories };
-  }
-
-  const loi = nullIfEmpty(ca.LOI);
-  if (loi !== null && /^(yes|no)$/i.test(loi)) {
-    customFields['mdLoi'] = { name: 'mdLoi', fieldType: 'boolean', value: /^yes$/i.test(loi) };
-  }
-
-  putStr('mdApplicantTypeNotes', ca.ApplicantTypeNotes);
-  putStr('mdGeography', ca.Geography);
-  putStr('fundingSource', ca.FundingSource);
-  putStr('mdFundingSourceNotes', ca.FundingSourceNotes);
-  putStr('mdFundingMethod', ca.FundingMethod);
-  putStr('mdFundingMethodNotes', ca.FundingMethodNotes);
-  putStr('mdEstAwards', ca.EstAwards);
-
-  // Preserve the raw range string so a partial/failed numeric parse loses nothing.
-  putStr('mdEstAmountsRaw', ca.EstAmounts);
-  // Preserve EstAvailFunds text only when it couldn't be parsed numerically.
-  const rawAvail = nullIfEmpty(ca.EstAvailFunds);
-  if (rawAvail !== null && totalAvailable === null) putStr('mdRawEstAvailFunds', rawAvail);
-
-  putStr('mdAwardPeriod', ca.AwardPeriod);
-  putStr('mdExpAwardDate', ca.ExpAwardDate);
-  putStr('mdElecSubmission', ca.ElecSubmission);
-  putStr('mdAwardStats', ca.AwardStats);
-  putStr('mdCategorySuggestion', ca.CategorySuggestion);
-
-  // ChangeNotes is often the placeholder "N/A" — drop those.
-  const changeNotes = nullIfEmpty(ca.ChangeNotes);
-  if (changeNotes !== null && changeNotes.toUpperCase() !== 'N/A') {
-    putStr('mdChangeNotes', changeNotes);
-  }
-
-  const subscribeUrl = nullIfNotUrl(nullIfEmpty(ca.AgencySubscribeURL));
-  if (subscribeUrl !== null) putStr('mdSubscribeUrl', subscribeUrl);
-  const eventsUrl = nullIfNotUrl(nullIfEmpty(ca.GrantEventsURL));
-  if (eventsUrl !== null) putStr('mdGrantEventsUrl', eventsUrl);
-
-  customFields['lastSyncedAt'] = {
-    name: 'lastSyncedAt',
-    fieldType: 'string',
-    value: syncedAt,
+  putString(fields, 'fundingSource', 'Public');
+  putString(fields, 'fundingInstrument', grant.assistance_type.join('; ') || 'Grant');
+  fields.lastSyncedAt = { name: 'lastSyncedAt', fieldType: 'string', value: syncedAt };
+  fields.mdCompassId = { name: 'mdCompassId', fieldType: 'number', value: grant.id };
+  putString(fields, 'mdSlug', grant.slug);
+  putString(fields, 'mdDataQuality', nullIfEmpty(grant.data_quality));
+  putString(fields, 'mdGeographicScope', nullIfEmpty(grant.geographic_scope));
+  fields.mdAcceptingApplications = {
+    name: 'mdAcceptingApplications',
+    fieldType: 'boolean',
+    value: grant.is_accepting_applications,
   };
+  fields.mdRecurring = { name: 'mdRecurring', fieldType: 'boolean', value: grant.is_recurring };
+  putList(fields, 'mdAssistanceTypes', grant.assistance_type);
+  putList(fields, 'mdEligibleIndustries', grant.eligible_industries);
+  putList(fields, 'mdEligibleCounties', grant.eligible_counties);
+  putList(fields, 'mdEligibleMunicipalities', grant.eligible_municipalities);
+  putList(fields, 'mdEligibleRegions', grant.eligible_regions);
+  putList(fields, 'mdEligibleIncentiveAreas', grant.eligible_incentive_areas);
+  putList(fields, 'mdEligibleOrganizationTypes', grant.eligible_organization_types);
+  putString(fields, 'mdBusinessStage', nullIfEmpty(grant.business_stage));
+  putString(fields, 'mdApplicationDeadlineRaw', nullIfEmpty(grant.application_deadline_string));
+  putString(fields, 'mdApplicationProcess', nullIfEmpty(grant.application_process_overview));
+  putString(fields, 'mdProgramAudience', nullIfEmpty(grant.program_audience));
+  putString(fields, 'mdUseOfFunds', nullIfEmpty(grant.use_of_funds));
+  putString(fields, 'mdGeographicEligibility', nullIfEmpty(grant.geographic_eligibility));
+  putList(fields, 'mdRequirements', grant.requirements_list);
+  putList(fields, 'mdSourceUrls', grant.source_urls);
+  fields.mdSourceCount = { name: 'mdSourceCount', fieldType: 'number', value: grant.source_count };
 
-  // Source URL: MD's GrantURL is usually absolute but occasionally free-form.
-  const source = nullIfNotUrl(nullIfEmpty(ca.GrantURL));
-
-  const lastModifiedAt = mdDateToIso(ca.LastUpdated);
-
-  const opp: MdOpportunityInput = {
-    id: portalIdToCgId(ca.PortalID),
-    title: nullIfEmpty(ca.Title) ?? '',
-    description,
-    status: {
-      value: status.value,
-      customValue: status.customValue,
-      description: null,
-    },
-    source,
-    funding: hasFunding
-      ? {
-          details: null,
-          totalAmountAvailable: totalAvailable,
-          minAwardAmount: minAward,
-          maxAwardAmount: maxAward,
-          minAwardCount: null,
-          maxAwardCount: null,
-          estimatedAwardCount: null,
-        }
-      : null,
-    keyDates: hasKeyDates
-      ? {
-          postDate: openDateSplit
-            ? {
-                name: 'Open Date',
-                eventType: 'singleDate',
-                date: openDateSplit.date,
-                time: openDateSplit.time,
-              }
-            : null,
-          closeDate: closeDateSplit
-            ? {
-                name: 'Application Deadline',
-                eventType: 'singleDate',
-                date: closeDateSplit.date,
-                time: closeDateSplit.time,
-              }
-            : null,
-          otherDates: Object.keys(otherDates).length > 0 ? otherDates : null,
-        }
-      : null,
-    acceptedApplicantTypes: acceptedApplicantTypes.length > 0 ? acceptedApplicantTypes : null,
-    customFields,
-    createdAt: lastModifiedAt,
-    lastModifiedAt,
-  };
-
-  return opp;
-}
-
-// =============================================================================
-// Reverse transform: MdOpportunity → MdGrant (best-effort)
-// =============================================================================
-
-/** Read a custom-field value off a CG opportunity, or `undefined` if absent. */
-function cfValue(opp: MdOpportunityInput, key: string): unknown {
-  return opp.customFields?.[key]?.value;
-}
-
-/** Coerce a custom-field value to a non-empty string, else `""` (MD's empty shape). */
-function cfString(opp: MdOpportunityInput, key: string): string {
-  const v = cfValue(opp, key);
-  return typeof v === 'string' ? v : '';
-}
-
-/** Join a custom-field string array back into MD's `;`-delimited form. */
-function cfList(opp: MdOpportunityInput, key: string): string {
-  const v = cfValue(opp, key);
-  return Array.isArray(v) ? v.filter((x) => typeof x === 'string').join('; ') : '';
-}
-
-/**
- * Reverse of `mdGrantToOpportunity`: reconstruct a raw `MdGrant` from a CG
- * opportunity. Pure, no validation.
- *
- * **Best-effort and lossy by design.** Fields with no CommonGrants home are
- * preserved in `ca*` custom fields and round-trip faithfully; values folded
- * into shared fields are reconstructed canonically and may lose original
- * phrasing:
- *
- *   - `Purpose` (folded into `description` behind `Description`) → `""`
- *   - `Description` loses original HTML (only the stripped text survives)
- *   - a mapped `status` loses its original casing (canonical label returned)
- *   - `EstAmounts` is reconstructed from the preserved raw string, not the
- *     parsed numeric range
- *
- * These drops are asserted in the adapter test suite so the round-trip
- * contract stays explicit.
- */
-export function mdOpportunityToGrant(opp: MdOpportunityInput): MdGrant {
-  const keyDates = opp.keyDates ?? null;
-
-  const agency = cfValue(opp, 'agency') as { name?: unknown } | undefined;
-  const additionalInfo = cfValue(opp, 'additionalInfo') as { url?: unknown } | undefined;
-  const contact = cfValue(opp, 'contactInfo') as
-    | { name?: unknown; email?: unknown; phone?: unknown; description?: unknown }
-    | undefined;
-  const costSharing = cfValue(opp, 'costSharing') as
-    | { isRequired?: unknown; percentage?: unknown; details?: unknown }
-    | undefined;
-  const loi = cfValue(opp, 'mdLoi');
-
-  // Reassemble MD's structured ContactInfo string from the parsed contact.
-  const contactInfo =
-    contact != null
-      ? [
-          typeof contact.name === 'string' && contact.name ? `name: ${contact.name}` : null,
-          typeof contact.email === 'string' && contact.email ? `email: ${contact.email}` : null,
-          typeof contact.phone === 'string' && contact.phone ? `tel: ${contact.phone}` : null,
-        ]
-          .filter((p): p is string => p !== null)
-          .map((p) => `${p};`)
-          .join(' ')
-      : '';
-
-  const matchingFunds =
-    typeof costSharing?.percentage === 'number'
-      ? percentToMdPercent(costSharing.percentage)
-      : costSharing?.isRequired === false
-        ? 'Not Required'
-        : '';
+  const fundingText = nullIfEmpty(grant.assistance_description);
+  const range = parseAmountRange(fundingText);
+  const deadline = nullIfEmpty(grant.application_deadline_date);
+  const status = normalizeStatus(grant);
 
   return {
-    PortalID: cfString(opp, 'mdPortalId'),
-    GrantID: cfString(opp, 'mdGrantId'),
-    Status: statusToMdString(opp.status),
-    LastUpdated: isoToMdDate(opp.lastModifiedAt),
-    ChangeNotes: cfString(opp, 'mdChangeNotes'),
-    AgencyDept: typeof agency?.name === 'string' ? agency.name : '',
-    Title: opp.title,
-    Type: cfString(opp, 'fundingInstrument'),
-    LOI: typeof loi === 'boolean' ? (loi ? 'Yes' : 'No') : '',
-    Categories: cfList(opp, 'mdCategories'),
-    CategorySuggestion: cfString(opp, 'mdCategorySuggestion'),
-    Purpose: '',
-    Description: opp.description,
-    ApplicantType: applicantTypesToMdString(opp.acceptedApplicantTypes),
-    ApplicantTypeNotes: cfString(opp, 'mdApplicantTypeNotes'),
-    Geography: cfString(opp, 'mdGeography'),
-    FundingSource: cfString(opp, 'fundingSource'),
-    FundingSourceNotes: cfString(opp, 'mdFundingSourceNotes'),
-    MatchingFunds: matchingFunds,
-    MatchingFundsNotes: typeof costSharing?.details === 'string' ? costSharing.details : '',
-    EstAvailFunds:
-      moneyToMdString(opp.funding?.totalAmountAvailable) ?? cfString(opp, 'mdRawEstAvailFunds'),
-    EstAwards: cfString(opp, 'mdEstAwards'),
-    EstAmounts: cfString(opp, 'mdEstAmountsRaw'),
-    FundingMethod: cfString(opp, 'mdFundingMethod'),
-    FundingMethodNotes: cfString(opp, 'mdFundingMethodNotes'),
-    OpenDate: eventToMdDate(keyDates?.postDate),
-    ApplicationDeadline: eventToMdDate(keyDates?.closeDate),
-    AwardPeriod: cfString(opp, 'mdAwardPeriod'),
-    ExpAwardDate: cfString(opp, 'mdExpAwardDate'),
-    ElecSubmission: cfString(opp, 'mdElecSubmission'),
-    GrantURL: isoSource(opp.source) ?? '',
-    AgencyURL: typeof additionalInfo?.url === 'string' ? additionalInfo.url : '',
-    AgencySubscribeURL: cfString(opp, 'mdSubscribeUrl'),
-    GrantEventsURL: cfString(opp, 'mdGrantEventsUrl'),
-    ContactInfo: contactInfo,
-    AwardStats: cfString(opp, 'mdAwardStats'),
+    id: slugToCgId(grant.slug),
+    title: grant.program_name,
+    description: stripHtml(nullIfEmpty(grant.program_description)) ?? '',
+    status: { ...status, description: null },
+    source: nullIfNotUrl(nullIfEmpty(grant.URL)),
+    funding:
+      fundingText || range.min || range.max
+        ? {
+            details: fundingText,
+            totalAmountAvailable: null,
+            minAwardAmount: range.min,
+            maxAwardAmount: range.max,
+            minAwardCount: null,
+            maxAwardCount: null,
+            estimatedAwardCount: null,
+          }
+        : null,
+    keyDates: deadline
+      ? {
+          postDate: null,
+          closeDate: singleDate(
+            'Application deadline',
+            deadline,
+            nullIfEmpty(grant.application_deadline_string),
+          ),
+          otherDates: null,
+        }
+      : null,
+    acceptedApplicantTypes: grant.eligible_organization_types.length
+      ? mapApplicantTypes(grant.eligible_organization_types)
+      : null,
+    customFields: fields,
+    createdAt: toIso(grant.created_at),
+    lastModifiedAt: toIso(grant.updated_at),
   };
 }
 
-/** Convert a CG `Money` value back to MD's plain dollar string, or null. */
-function moneyToMdString(m: { amount?: unknown } | null | undefined): string | null {
-  if (!m || typeof m.amount !== 'string') return null;
-  const n = Number(m.amount);
-  if (!Number.isFinite(n)) return null;
-  return Number.isInteger(n) ? `$${n.toLocaleString('en-US')}` : `$${m.amount}`;
+function attachmentName(downloadUrl: string): string {
+  const raw = new URL(downloadUrl).pathname.split('/').pop() || 'Attachment';
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
 }
 
-/** A CG single-date event → MD's `"YYYY-MM-DD HH:MM:SS"` string (or `""`). */
-function eventToMdDate(event: unknown): string {
-  if (!event || typeof event !== 'object') return '';
-  const e = event as { eventType?: unknown; date?: unknown; time?: unknown };
-  if (e.eventType !== 'singleDate') return '';
-  const date = e.date instanceof Date ? e.date.toISOString().slice(0, 10) : e.date;
-  if (typeof date !== 'string') return '';
-  return typeof e.time === 'string' && e.time ? `${date} ${e.time}` : date;
+function cfValue(opp: MdOpportunityInput, name: string): unknown {
+  return opp.customFields?.[name]?.value;
 }
 
-/** Convert a CG ISO datetime back to MD's space-separated `"YYYY-MM-DD HH:MM:SS"`. */
-function isoToMdDate(v: unknown): string {
-  const s = typeof v === 'string' ? v : v instanceof Date ? v.toISOString() : '';
-  if (!s) return '';
-  const m = s.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})/);
-  return m ? `${m[1]} ${m[2]}` : s;
+function cfString(opp: MdOpportunityInput, name: string): string {
+  const value = cfValue(opp, name);
+  return typeof value === 'string' ? value : '';
 }
 
-/** Coerce `source` (string | Date | null) to a string URL or null. */
-function isoSource(v: unknown): string | null {
-  return typeof v === 'string' ? v : null;
+function cfList(opp: MdOpportunityInput, name: string): string[] {
+  const value = cfValue(opp, name);
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === 'string')
+    : [];
 }
 
-// =============================================================================
-// Search-text helper — used by the SQL tier for FTS indexing
-// =============================================================================
-
-/** Concatenate searchable text fields into a single string for FTS indexing. */
-export function buildSearchText(ca: MdGrant): string {
-  const parts: string[] = [
-    ca.Title,
-    stripHtml(ca.Description) ?? '',
-    stripHtml(ca.Purpose) ?? '',
-    ca.AgencyDept,
-    ca.Categories,
-    ca.Type,
-    ca.FundingSource,
-  ];
-  return parts
-    .map((p) => p.trim())
-    .filter((p) => p.length > 0)
-    .join(' ')
-    .replace(/\s+/g, ' ');
+function isoValue(value: unknown): string {
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value === 'string') return new Date(value).toISOString();
+  return new Date(0).toISOString();
 }
+
+/** Best-effort reverse transform required by the SDK's plugin contract. */
+export function mdOpportunityToGrant(opp: MdOpportunityInput): MdGrant {
+  const agency = cfValue(opp, 'agency') as { name?: unknown } | undefined;
+  const contact = cfValue(opp, 'contactInfo') as
+    | { name?: unknown; email?: unknown; phone?: unknown }
+    | undefined;
+  const attachments = cfValue(opp, 'attachments');
+  const closeDate = opp.keyDates?.closeDate;
+  const rawClose = closeDate && 'date' in closeDate ? closeDate.date : '';
+  const close =
+    rawClose instanceof Date
+      ? rawClose.toISOString().slice(0, 10)
+      : typeof rawClose === 'string'
+        ? rawClose
+        : '';
+  return {
+    id:
+      typeof cfValue(opp, 'mdCompassId') === 'number' ? (cfValue(opp, 'mdCompassId') as number) : 0,
+    slug: cfString(opp, 'mdSlug'),
+    program_name: opp.title,
+    agency: typeof agency?.name === 'string' ? agency.name : '',
+    URL: typeof opp.source === 'string' ? opp.source : '',
+    program_description: opp.description,
+    is_accepting_applications: cfValue(opp, 'mdAcceptingApplications') === true,
+    is_recurring: cfValue(opp, 'mdRecurring') === true,
+    data_quality: cfString(opp, 'mdDataQuality'),
+    funding_source: cfString(opp, 'fundingSource').toLowerCase(),
+    geographic_scope: cfString(opp, 'mdGeographicScope'),
+    assistance_type: cfList(opp, 'mdAssistanceTypes'),
+    assistance_description: opp.funding?.details ?? '',
+    eligible_industries: cfList(opp, 'mdEligibleIndustries'),
+    eligible_counties: cfList(opp, 'mdEligibleCounties'),
+    eligible_municipalities: cfList(opp, 'mdEligibleMunicipalities'),
+    eligible_regions: cfList(opp, 'mdEligibleRegions'),
+    eligible_incentive_areas: cfList(opp, 'mdEligibleIncentiveAreas'),
+    eligible_organization_types: cfList(opp, 'mdEligibleOrganizationTypes'),
+    business_stage: cfString(opp, 'mdBusinessStage'),
+    application_deadline_string: cfString(opp, 'mdApplicationDeadlineRaw'),
+    application_deadline_date: close,
+    application_process_overview: cfString(opp, 'mdApplicationProcess'),
+    program_audience: cfString(opp, 'mdProgramAudience'),
+    use_of_funds: cfString(opp, 'mdUseOfFunds'),
+    geographic_eligibility: cfString(opp, 'mdGeographicEligibility'),
+    requirements_list: cfList(opp, 'mdRequirements'),
+    contact_name: typeof contact?.name === 'string' ? contact.name : '',
+    contact_email: typeof contact?.email === 'string' ? contact.email : '',
+    contact_phone: typeof contact?.phone === 'string' ? contact.phone : '',
+    source_count:
+      typeof cfValue(opp, 'mdSourceCount') === 'number'
+        ? (cfValue(opp, 'mdSourceCount') as number)
+        : 0,
+    source_urls: cfList(opp, 'mdSourceUrls'),
+    attachment_urls: Array.isArray(attachments)
+      ? attachments
+          .map((item) => (item as { downloadUrl?: unknown }).downloadUrl)
+          .filter((url): url is string => typeof url === 'string')
+      : [],
+    created_at: isoValue(opp.createdAt),
+    updated_at: isoValue(opp.lastModifiedAt),
+  };
+}
+
+export function buildSearchText(grant: MdGrant): string {
+  return [
+    grant.program_name,
+    grant.agency,
+    stripHtml(grant.program_description),
+    grant.assistance_description,
+    grant.program_audience,
+    grant.use_of_funds,
+    grant.geographic_eligibility,
+    ...grant.requirements_list,
+    ...grant.eligible_industries,
+    ...grant.eligible_counties,
+    ...grant.eligible_organization_types,
+  ]
+    .filter((value): value is string => Boolean(value))
+    .join(' ');
+}
+
+// Scaffold-era compatibility helpers. Compass dates are already ISO values.
+export const mdDateToIso = (value: string | null): string => (value ? toIso(value) : '');
+export const splitMdDateTime = (value: string | null) => {
+  const match = value?.match(/^(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2}:\d{2}))?/);
+  return match ? { date: match[1] as string, time: match[2] ?? null } : null;
+};
+export const parseMatchingFunds = (_value: string | null) => null;

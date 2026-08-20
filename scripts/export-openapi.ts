@@ -34,6 +34,7 @@ const noopRepo: IOppRepo = {
   upsert: async () => {},
   upsertBatch: async () => {},
   allHashesBySourceId: async () => new Map<string, string>(),
+  deleteBySourceIds: async () => {},
   getLastSyncedAt: async () => null,
   getWatermark: async () => null,
   setWatermark: async () => {},

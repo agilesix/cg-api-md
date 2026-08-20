@@ -1,333 +1,114 @@
-import { describe, it, expect } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import {
   buildSearchText,
+  mapApplicantTypes,
   mdGrantToOpportunity,
   mdOpportunityToGrant,
-  mapApplicantTypes,
-  nullIfEmpty,
-  nullIfNotUrl,
   normalizeStatus,
   parseAmountRange,
-  parseFinancial,
-  parseMdContact,
-  parseMatchingFunds,
-  portalIdToCgId,
-  splitMdDateTime,
-  splitList,
-  statusToMdString,
-  stripHtml,
+  slugToCgId,
 } from '../../src/adapter';
 import { ca1Fixture, ca2FixtureEdgeCases } from './fixtures';
 
-const SYNCED_AT = '2026-06-25T00:00:00Z';
-
-// =============================================================================
-// Primitive helpers
-// =============================================================================
-
-describe('primitive helpers', () => {
-  it('nullIfEmpty trims and treats empty as null', () => {
-    expect(nullIfEmpty('  x ')).toBe('x');
-    expect(nullIfEmpty('   ')).toBeNull();
-    expect(nullIfEmpty(null)).toBeNull();
+describe('Maryland Compass transform', () => {
+  it('creates stable ids and maps core source fields', () => {
+    const opportunity = mdGrantToOpportunity(ca1Fixture, '2026-08-20T00:00:00Z');
+    expect(opportunity.id).toBe(slugToCgId(ca1Fixture.slug));
+    expect(opportunity.title).toBe('Build Our Future Grant Program');
+    expect(opportunity.status.value).toBe('open');
+    expect(opportunity.funding?.maxAwardAmount?.amount).toBe('2000000.00');
+    expect(opportunity.keyDates?.closeDate).toMatchObject({ date: '2030-06-30' });
+    expect(opportunity.customFields?.mdEligibleCounties?.value).toEqual(['All']);
+    expect(opportunity.customFields?.attachments?.value).toHaveLength(1);
   });
 
-  it('nullIfNotUrl keeps absolute URLs, nulls free-form text', () => {
-    expect(nullIfNotUrl('https://example.gov')).toBe('https://example.gov');
-    expect(nullIfNotUrl('TBD')).toBeNull();
-    expect(nullIfNotUrl('not a url')).toBeNull();
+  it('does not call a recurring but currently closed program open', () => {
+    expect(
+      normalizeStatus({
+        ...ca2FixtureEdgeCases,
+        is_recurring: true,
+        is_accepting_applications: false,
+      }),
+    ).toEqual({ value: 'custom', customValue: 'Recurring' });
   });
 
-  it('stripHtml removes tags and decodes entities', () => {
-    expect(stripHtml('a <a href="x">b</a> &amp; c')).toBe('a b & c');
-  });
-
-  it('splitList splits the source `;`-delimited columns', () => {
-    expect(splitList('A; B ;; C')).toEqual(['A', 'B', 'C']);
-    expect(splitList(null)).toEqual([]);
-  });
-
-  it('portalIdToCgId is deterministic', () => {
-    expect(portalIdToCgId('ca-178419')).toBe(portalIdToCgId('ca-178419'));
-    expect(portalIdToCgId('a')).not.toBe(portalIdToCgId('b'));
-  });
-});
-
-// =============================================================================
-// Financial parsing
-// =============================================================================
-
-describe('parseFinancial', () => {
-  it('parses plain, dollar, million, and k forms', () => {
-    expect(parseFinancial('$1,000,000')?.amount).toBe('1000000.00');
-    expect(parseFinancial('500000')?.amount).toBe('500000.00');
-    expect(parseFinancial('$2 million')?.amount).toBe('2000000.00');
-    expect(parseFinancial('500k')?.amount).toBe('500000.00');
-  });
-
-  it('returns null for free-form values', () => {
-    expect(parseFinancial('Varies')).toBeNull();
-    expect(parseFinancial('')).toBeNull();
-  });
-});
-
-describe('parseAmountRange', () => {
-  it('parses a two-value range', () => {
-    const r = parseAmountRange('Between $5,000 and $375,000');
-    expect(r.min?.amount).toBe('5000.00');
-    expect(r.max?.amount).toBe('375000.00');
-  });
-
-  it('treats a single "up to" value as a max', () => {
-    const r = parseAmountRange('Up to $50,000');
-    expect(r.min).toBeNull();
-    expect(r.max?.amount).toBe('50000.00');
-  });
-
-  it('treats a single "at least" value as a min', () => {
-    const r = parseAmountRange('At least $10,000');
-    expect(r.min?.amount).toBe('10000.00');
-    expect(r.max).toBeNull();
-  });
-
-  it('returns nulls when no dollar amount is present', () => {
-    expect(parseAmountRange('Dependent on submissions')).toEqual({ min: null, max: null });
-  });
-});
-
-// =============================================================================
-// Matching funds
-// =============================================================================
-
-describe('parseMatchingFunds', () => {
-  it('parses a percentage into isRequired + percentage (0–100)', () => {
-    expect(parseMatchingFunds('35%')).toEqual({ isRequired: true, percentage: 35 });
-    expect(parseMatchingFunds('100%')).toEqual({ isRequired: true, percentage: 100 });
-  });
-
-  it('treats 0% as not required', () => {
-    expect(parseMatchingFunds('0%')).toEqual({ isRequired: false, percentage: 0 });
-  });
-
-  it('handles "Not Required"', () => {
-    expect(parseMatchingFunds('Not Required')).toEqual({ isRequired: false, percentage: null });
-  });
-
-  it('returns null for empty/unrecognized', () => {
-    expect(parseMatchingFunds('')).toBeNull();
-    expect(parseMatchingFunds('maybe')).toBeNull();
-  });
-});
-
-// =============================================================================
-// Dates
-// =============================================================================
-
-describe('splitMdDateTime', () => {
-  it('splits a space-separated datetime', () => {
-    expect(splitMdDateTime('2026-08-03 17:00:00')).toEqual({
-      date: '2026-08-03',
-      time: '17:00:00',
+  it('preserves confirm-with-agency status regardless of a historical deadline', () => {
+    expect(
+      normalizeStatus({ ...ca2FixtureEdgeCases, application_deadline_date: '2020-01-01' }),
+    ).toEqual({ value: 'custom', customValue: 'Confirm with agency' });
+    expect(normalizeStatus(ca2FixtureEdgeCases)).toEqual({
+      value: 'custom',
+      customValue: 'Confirm with agency',
     });
   });
 
-  it('handles a date-only value', () => {
-    expect(splitMdDateTime('2026-08-03')).toEqual({ date: '2026-08-03', time: null });
-  });
-
-  it('returns null for unparseable input', () => {
-    expect(splitMdDateTime('not-a-date')).toBeNull();
-    expect(splitMdDateTime('')).toBeNull();
-  });
-});
-
-// =============================================================================
-// Status
-// =============================================================================
-
-describe('status mapping', () => {
-  it('maps the MD vocabulary to the CG enum', () => {
-    expect(normalizeStatus('active')).toEqual({ value: 'open', customValue: null });
-    expect(normalizeStatus('closed')).toEqual({ value: 'closed', customValue: null });
-    expect(normalizeStatus('forecasted')).toEqual({ value: 'forecasted', customValue: null });
-  });
-
-  it('falls back to custom for unknown values', () => {
-    expect(normalizeStatus('archived')).toEqual({ value: 'custom', customValue: 'archived' });
-  });
-
-  it('round-trips canonical labels', () => {
-    expect(statusToMdString({ value: 'open' })).toBe('active');
-    expect(statusToMdString({ value: 'custom', customValue: 'archived' })).toBe('archived');
-  });
-});
-
-// =============================================================================
-// Contact
-// =============================================================================
-
-describe('parseMdContact', () => {
-  it('parses the structured key: value; format', () => {
-    expect(parseMdContact('name: Jane Doe; email: grants@example.gov; tel: 1-555-0100;')).toEqual({
-      name: 'Jane Doe',
-      email: 'grants@example.gov',
-      phone: '1-555-0100',
-      description: null,
-    });
-  });
-
-  it('preserves a bare value in description', () => {
-    expect(parseMdContact('Grants Office')).toEqual({
-      name: null,
-      email: null,
-      phone: null,
-      description: 'Grants Office',
-    });
-  });
-
-  it('returns null when empty', () => {
-    expect(parseMdContact('')).toBeNull();
-  });
-});
-
-// =============================================================================
-// Applicant types → native acceptedApplicantTypes
-// =============================================================================
-
-describe('mapApplicantTypes', () => {
-  it('maps confident labels to the standard enum, custom for the rest', () => {
-    expect(mapApplicantTypes('Individual; Tribal Government; Business')).toEqual([
+  it('does not overstate coarse applicant categories', () => {
+    expect(mapApplicantTypes(['individuals', 'government'])).toEqual([
       { value: 'individual', customValue: null, description: null },
-      { value: 'government_tribal', customValue: null, description: null },
-      { value: 'custom', customValue: 'Business', description: null },
+      { value: 'custom', customValue: 'government', description: null },
     ]);
   });
-});
 
-// =============================================================================
-// Full transform
-// =============================================================================
-
-describe('mdGrantToOpportunity (fully-populated fixture)', () => {
-  const opp = mdGrantToOpportunity(ca1Fixture, SYNCED_AT);
-
-  it('maps the core fields', () => {
-    expect(opp.id).toBe(portalIdToCgId('ca-178419'));
-    expect(opp.title).toBe('Wood Products Innovation Grant');
-    expect(opp.status.value).toBe('open');
-    expect(opp.source).toBe('https://bof.example.gov/grant-guidelines.pdf');
-    expect(opp.description).toContain('sustainable forest restoration');
+  it('parses ranges and up-to amounts from assistance text', () => {
+    expect(parseAmountRange('$5,000 to $25,000')).toMatchObject({
+      min: { amount: '5000.00' },
+      max: { amount: '25000.00' },
+    });
+    expect(parseAmountRange('up to $2 million').max?.amount).toBe('2000000.00');
   });
 
-  it('parses the funding range and available total', () => {
-    expect(opp.funding?.minAwardAmount?.amount).toBe('5000.00');
-    expect(opp.funding?.maxAwardAmount?.amount).toBe('375000.00');
-    expect(opp.funding?.totalAmountAvailable?.amount).toBe('1000000.00');
+  it('does not turn historical or total program funding into an award cap', () => {
+    expect(parseAmountRange('$263,000 was allocated across multiple recipients')).toEqual({
+      min: null,
+      max: null,
+    });
+    expect(parseAmountRange('The program previously received a $997,266 EPA grant')).toEqual({
+      min: null,
+      max: null,
+    });
+    expect(parseAmountRange('Approximately $400,000 in funding is anticipated')).toEqual({
+      min: null,
+      max: null,
+    });
   });
 
-  it('splits the key dates', () => {
-    const postDate = opp.keyDates?.postDate as { date?: string } | null | undefined;
-    const closeDate = opp.keyDates?.closeDate as { date?: string } | null | undefined;
-    expect(postDate?.date).toBe('2026-06-22');
-    expect(closeDate?.date).toBe('2026-08-03');
+  it('prefers an explicit range over unrelated later cap language', () => {
+    expect(
+      parseAmountRange(
+        'Annual awards range from a minimum of $1,000 to a maximum of $5,000. Funding may continue for up to eight semesters.',
+      ),
+    ).toMatchObject({ min: { amount: '1000.00' }, max: { amount: '5000.00' } });
+    expect(
+      parseAmountRange('Provides a $5,000–$10,000 incentive and a separate loan of up to $35,000.'),
+    ).toMatchObject({ min: { amount: '5000.00' }, max: { amount: '10000.00' } });
   });
 
-  it('uses native acceptedApplicantTypes', () => {
-    const values = (opp.acceptedApplicantTypes ?? []).map((a) => a.value);
-    expect(values).toContain('individual');
-    expect(values).toContain('custom'); // Business / Nonprofit / Public Agency
+  it('keeps malformed attachment encoding from aborting the transform', () => {
+    const opportunity = mdGrantToOpportunity(
+      { ...ca1Fixture, attachment_urls: ['https://example.gov/%E0%A4%A'] },
+      '2026-08-20T00:00:00Z',
+    );
+    expect(opportunity.customFields?.attachments?.value).toEqual([
+      {
+        downloadUrl: 'https://example.gov/%E0%A4%A',
+        name: '%E0%A4%A',
+        mimeType: null,
+      },
+    ]);
   });
 
-  it('folds matching funds into costSharing (Not Required + notes → details)', () => {
-    const cs = opp.customFields?.['costSharing']?.value as {
-      isRequired: boolean;
-      percentage: number | null;
-      details: string | null;
-    };
-    expect(cs.isRequired).toBe(false);
-    expect(cs.percentage).toBeNull();
-    expect(cs.details).toContain('Greater consideration');
+  it('round-trips the source-specific fields required by the plugin', () => {
+    const opportunity = mdGrantToOpportunity(ca1Fixture, '2026-08-20T00:00:00Z');
+    const grant = mdOpportunityToGrant(opportunity);
+    expect(grant.slug).toBe(ca1Fixture.slug);
+    expect(grant.id).toBe(ca1Fixture.id);
+    expect(grant.requirements_list).toEqual(ca1Fixture.requirements_list);
   });
 
-  it('uses cross-source shared keys (fundingSource, fundingInstrument, lastSyncedAt)', () => {
-    expect(opp.customFields?.['fundingSource']?.value).toBe('State');
-    expect(opp.customFields?.['fundingInstrument']?.value).toBe('Grant');
-    expect(opp.customFields?.['lastSyncedAt']?.value).toBe(SYNCED_AT);
-  });
-
-  it('keeps MD-specific fields prefixed', () => {
-    expect(opp.customFields?.['mdPortalId']?.value).toBe('ca-178419');
-    expect(opp.customFields?.['mdCategories']?.value).toEqual(['Energy', 'Environment & Water']);
-    expect(opp.customFields?.['mdLoi']?.value).toBe(false);
-    expect(opp.customFields?.['mdEstAmountsRaw']?.value).toBe('Between $5,000 and $375,000');
-  });
-});
-
-describe('mdGrantToOpportunity (edge cases)', () => {
-  const opp = mdGrantToOpportunity(ca2FixtureEdgeCases, SYNCED_AT);
-
-  it('maps forecasted status and falls back to Purpose for description', () => {
-    expect(opp.status.value).toBe('forecasted');
-    expect(opp.description).toBe('Fallback purpose used as description.');
-  });
-
-  it('records a percentage match in costSharing', () => {
-    const cs = opp.customFields?.['costSharing']?.value as {
-      isRequired: boolean;
-      percentage: number;
-    };
-    expect(cs.isRequired).toBe(true);
-    expect(cs.percentage).toBe(35);
-  });
-
-  it('drops a non-URL source and agency URL', () => {
-    expect(opp.source).toBeNull();
-    expect(opp.customFields?.['additionalInfo']).toBeUndefined();
-  });
-
-  it('omits keyDates when all dates are empty', () => {
-    expect(opp.keyDates).toBeNull();
-  });
-});
-
-// =============================================================================
-// Round-trip
-// =============================================================================
-
-describe('mdOpportunityToGrant (reverse, best-effort)', () => {
-  const opp = mdGrantToOpportunity(ca1Fixture, SYNCED_AT);
-  const back = mdOpportunityToGrant(opp);
-
-  it('round-trips faithfully where a CG home exists', () => {
-    expect(back.PortalID).toBe('ca-178419');
-    expect(back.Title).toBe('Wood Products Innovation Grant');
-    expect(back.Status).toBe('active');
-    expect(back.Type).toBe('Grant');
-    expect(back.FundingSource).toBe('State');
-    expect(back.Categories).toBe('Energy; Environment & Water');
-    expect(back.MatchingFunds).toBe('Not Required');
-    expect(back.ApplicantType).toContain('Individual');
-  });
-
-  it('reconstructs the structured ContactInfo string', () => {
-    expect(back.ContactInfo).toContain('name: Jane Doe;');
-    expect(back.ContactInfo).toContain('email: grants@example.gov;');
-  });
-
-  it('drops fields with no CommonGrants home (lossy by design)', () => {
-    expect(back.Purpose).toBe(''); // folded into Description
-  });
-});
-
-// =============================================================================
-// Search text
-// =============================================================================
-
-describe('buildSearchText', () => {
-  it('concatenates the searchable fields', () => {
+  it('builds useful search text', () => {
     const text = buildSearchText(ca1Fixture);
-    expect(text).toContain('Wood Products Innovation Grant');
-    expect(text).toContain('Board of Forestry');
-    expect(text).toContain('Energy');
+    expect(text).toContain('MEDCO');
+    expect(text).toContain('Manufacturing');
+    expect(text).toContain('Matching funds are required');
   });
 });

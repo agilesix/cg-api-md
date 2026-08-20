@@ -30,6 +30,7 @@ describe('core contracts', () => {
       upsert: async (_record: StoredOpportunity) => {},
       upsertBatch: async (_records: StoredOpportunity[]) => {},
       allHashesBySourceId: async () => new Map<string, string>(),
+      deleteBySourceIds: async (_sourceIds: string[]) => {},
       getLastSyncedAt: async () => null,
       getWatermark: async () => null,
       setWatermark: async (_value: string) => {},

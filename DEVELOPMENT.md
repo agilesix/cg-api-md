@@ -91,11 +91,11 @@ echo 'SYNC_SECRET=local-dev-secret' > .dev.vars
 Then trigger a sync:
 
 ```bash
-curl -X POST http://localhost:8787/common-grants/admin/sync \
+curl -X POST http://localhost:8787/admin/sync \
   -H 'Authorization: Bearer local-dev-secret'
 ```
 
-This fetches opportunities from the configured source, transforms them into CommonGrants format, and upserts them into local D1. (The bundled reference adapter points at a fictional CKAN host, so this only succeeds once `src/adapter/` and `MD_API_BASE_URL` point at a real source — see the note at the top of the README.) Syncs are incremental: the first run is a full load, and later runs fetch only records modified since the stored watermark (a `?force=true` query param forces a full re-sync).
+This fetches qualifying opportunities from Maryland Community Compass, transforms them into CommonGrants format, and reconciles them into local D1. Compass does not expose an updated-since collection filter, so every run scans the filtered collection and uses content hashes to avoid rewriting unchanged rows. A `?force=true` query parameter forces every row to be transformed and rewritten.
 
 ## Tests
 

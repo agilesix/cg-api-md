@@ -19,32 +19,32 @@ describe('storedFromCommon', () => {
   it('derives the denormalized columns from the CG opportunity + per-source metadata', () => {
     expect(row).toMatchObject({
       id: opp.id,
-      sourceId: 'ca-178419',
-      title: 'Wood Products Innovation Grant',
+      sourceId: 'build-our-future-grant-pilot-program',
+      title: 'Build Our Future Grant Program',
       status: 'open',
-      minAwardAmountCents: 500_000, // $5,000
-      maxAwardAmountCents: 37_500_000, // $375,000
-      totalAmountAvailableCents: 100_000_000, // $1,000,000
+      minAwardAmountCents: null,
+      maxAwardAmountCents: 200_000_000,
+      totalAmountAvailableCents: null,
       contentHash: 'deadbeef',
     });
-    expect(row.searchText).toContain('Forestry');
+    expect(row.searchText).toContain('MEDCO');
   });
 
   it('derives close/post dates from keyDates as calendar-date strings', () => {
-    expect(row.postDate).toBe('2026-06-22T17:20:00');
-    expect(row.closeDate).toBe('2026-08-03T17:00:00');
+    expect(row.postDate).toBeNull();
+    expect(row.closeDate).toBe('2030-06-30');
   });
 
   it('serializes the opportunity to rawJson, preserving the string date shape', () => {
     const parsed = JSON.parse(row.rawJson);
     expect(parsed.id).toBe(opp.id);
     expect(parsed.title).toBe(opp.title);
-    expect(parsed.keyDates.closeDate.date).toBe('2026-08-03');
+    expect(parsed.keyDates.closeDate.date).toBe('2030-06-30');
   });
 
   it('leaves money columns null when funding is absent', () => {
     const noFunding = mdGrantToOpportunity(
-      { ...ca1Fixture, EstAmounts: '', EstAvailFunds: '' },
+      { ...ca1Fixture, assistance_description: '' },
       '2026-06-25T00:00:00Z',
     );
     const r = storedFromCommon(noFunding, { sourceId: 'x', searchText: '', contentHash: 'h' });

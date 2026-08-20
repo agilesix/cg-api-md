@@ -16,14 +16,14 @@
 import type { MdGrant } from './mdSource';
 
 /** Source-system identifier extractor — the per-source key used for upsert/snapshot keying. */
-export const getSourceId = (grant: MdGrant): string => grant.PortalID;
+export const getSourceId = (grant: MdGrant): string => grant.slug;
 
 /**
  * Source last-modified extractor — the per-source field the incremental ETL
- * uses to advance its high-watermark. MD's `LastUpdated` is a lexicographically
- * sortable `"YYYY-MM-DD HH:MM:SS"` string, compared verbatim (no normalization).
+ * uses to advance its high-watermark. Compass's `updated_at` is an ISO 8601
+ * datetime whose normalized source representation is lexicographically sortable.
  */
-export const getModifiedAt = (grant: MdGrant): string => grant.LastUpdated;
+export const getModifiedAt = (grant: MdGrant): string => new Date(grant.updated_at).toISOString();
 
 // Plugin + schema + types
 export {
@@ -34,10 +34,16 @@ export {
 } from './plugin';
 
 // HTTP client
-export { MdSourceClient, MdApiError } from './MdSourceClient';
+export { MdSourceClient, MdApiError, MdPaginationError } from './MdSourceClient';
 
 // Raw source schema + type (useful for fixtures / tests downstream)
-export { MdGrantSchema, CkanDatastoreResponseSchema, type MdGrant } from './mdSource';
+export {
+  MdGrantSchema,
+  MdGrantSummarySchema,
+  MdGrantListResponseSchema,
+  type MdGrant,
+  type MdGrantSummary,
+} from './mdSource';
 
 // Pure transform functions (exported so the ETL/tests can use them directly)
 export {
@@ -45,6 +51,7 @@ export {
   mdOpportunityToGrant,
   buildSearchText,
   portalIdToCgId,
+  slugToCgId,
   // Lower-level helpers are exported for testability / advanced use.
   normalizeStatus,
   statusToMdString,
@@ -67,6 +74,7 @@ export {
   AgencyValueSchema,
   ContactInfoValueSchema,
   AdditionalInfoValueSchema,
-  CostSharingValueSchema,
+  EligibilityCriteriaValueSchema,
+  AttachmentListValueSchema,
   MdStringListSchema,
 } from './fields';
