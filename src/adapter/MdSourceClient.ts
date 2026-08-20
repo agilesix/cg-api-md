@@ -23,6 +23,10 @@ const DETAIL_CONCURRENCY = 5;
 const MAX_ATTEMPTS = 4;
 const REQUEST_TIMEOUT_MS = 10_000;
 const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
+const REQUEST_HEADERS = {
+  accept: 'application/json',
+  'user-agent': 'cg-api-md/0.1 (+https://github.com/agilesix/cg-api-md)',
+} as const;
 
 /** Read-only client for Maryland Community Compass's incentives REST API. */
 export class MdSourceClient implements ISourceClient<MdGrant> {
@@ -105,7 +109,7 @@ export class MdSourceClient implements ISourceClient<MdGrant> {
       const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
       try {
         const response = await fetch(url, {
-          headers: { accept: 'application/json' },
+          headers: REQUEST_HEADERS,
           signal: controller.signal,
         });
         if (!RETRYABLE_STATUSES.has(response.status) || attempt === MAX_ATTEMPTS) {
