@@ -37,6 +37,12 @@ describe('MdSourceClient', () => {
     expect(String(vi.mocked(fetch).mock.calls[0]?.[0])).toContain(
       `/incentives/${ca1Fixture.slug}/`,
     );
+    expect(vi.mocked(fetch).mock.calls[0]?.[1]).toMatchObject({
+      headers: {
+        accept: 'application/json',
+        'user-agent': 'cg-api-md/0.1 (+https://github.com/agilesix/cg-api-md)',
+      },
+    });
   });
 
   it('normalizes nullable Compass metadata', async () => {
