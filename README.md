@@ -4,32 +4,13 @@ A [CommonGrants](https://commongrants.org)-compliant HTTP API that surfaces Mary
 
 It is a sibling of the [Pennsylvania API](https://github.com/agilesix/cg-api-pa), the [California API](https://github.com/agilesix/cg-api-ca), and the [Washington API](https://github.com/agilesix/cg-api-wa), and shares their architecture; only the `src/adapter/` layer differs.
 
-> ### 🚧 Status: scaffolding only — the Maryland adapter is not written yet
->
-> Everything outside `src/adapter/` is done and working: routes, services, storage
-> tiers, incremental ETL, OpenAPI docs, CI, and preview/production deploys.
->
-> **Two things are still unknown and blocking a live sync:**
->
-> 1. **Maryland's upstream source.** `MD_API_BASE_URL` in `wrangler.jsonc` points at
->    `md-source.invalid`, a deliberately unresolvable placeholder — no real Maryland
->    endpoint has been identified yet.
-> 2. **The adapter itself.** `src/adapter/` currently holds a complete, tested
->    **CKAN DataStore** adapter carried over from the template
->    (`MdSourceClient`, `MdPlugin`, `MdGrant`, `mdGrantToOpportunity`). It compiles
->    and its tests pass, so the pipeline runs end to end — but it describes a
->    generic CKAN portal, not Maryland's actual data.
->
-> Treat `src/adapter/` as a reference implementation to replace, not as a
-> starting integration. See [Implementing the Maryland adapter](#implementing-the-maryland-adapter).
-
 ## Overview
 
-The API fetches funding opportunity data from Maryland's upstream grants source, normalizes it into the CommonGrants `Opportunity` schema (plus MD-specific custom fields), and serves it via standard CommonGrants endpoints.
+The API fetches public grant programs from the [Maryland Community Compass](https://compass.maryland.gov/incentives/) incentives API, normalizes them into the CommonGrants `Opportunity` schema (plus MD-specific custom fields), and serves them via standard CommonGrants endpoints.
 
-The carried-over reference adapter reads a **CKAN DataStore** endpoint (`datastore_search?resource_id=…`), the shape used by a number of state open-data portals. Once Maryland's source is identified, only `src/adapter/` changes — the layers above it are unaffected whether the source turns out to be CKAN, a WordPress REST API, a bespoke JSON feed, or a CSV drop.
+The source client requests records categorized as grants and scoped to state, county, local, or regional programs. It hydrates each list summary from the detail endpoint, then includes records whose funding source is public and whose Compass data-quality rating is not low.
 
-Data is kept fresh by a scheduled ETL that runs **every 8 hours**. Syncs are **incremental**: the ETL tracks a high-watermark of the maximum source last-modified value ingested and asks the upstream for only the changed delta, so a steady-state run fetches a handful of records instead of re-streaming the whole dataset. Records are never deleted — an opportunity removed upstream stays at its last-known state.
+Data is kept fresh by a scheduled ETL that runs **daily**. Compass exposes `updated_at` only on detail records and does not provide an updated-since collection filter, so each sync scans and hydrates the filtered collection before applying the local high-watermark. Detail requests use bounded concurrency, timeouts, and retry backoff. After a successful non-empty scan, stored records that no longer qualify are removed. Syncs run from the scheduled or protected admin handlers, not from ordinary HTTP requests.
 
 **Default deployment:** Cloudflare Workers + D1 (SQLite) + R2 (raw snapshots). Every layer is swappable — see [PORTING.md](PORTING.md) for recipes.
 
@@ -102,39 +83,19 @@ Then hit `http://localhost:8787/docs`.
 
 - **TypeScript + Hono on Cloudflare Workers.** Routes defined with `@hono/zod-openapi` so the OpenAPI spec is auto-generated at `/openapi.json`. Docs UI at `/docs` (Scalar via CDN, no bundled dependency).
 - **Schemas from `@common-grants/sdk`.** No handwritten opportunity schema, filters, or pagination envelope — the SDK provides them. Applicant eligibility uses the native `acceptedApplicantTypes` field.
-- **Custom fields aligned with the [CommonGrants custom fields catalog](https://commongrants.org/custom-fields/).** Catalog value schemas (`agency`, `contactInfo`, `additionalInfo`, `costSharing`) are mirrored verbatim from the grants.gov plugin. Concepts shared with other state sources use **unprefixed keys** (`fundingSource`, `fundingInstrument`, `lastSyncedAt`) defined identically in the PA plugin; source-unique data stays `md*`-prefixed. Applicant eligibility uses the native `acceptedApplicantTypes` field, and matching-funds requirements fold into `costSharing` (`{ isRequired, percentage, details }`).
+- **Custom fields aligned with the [CommonGrants custom fields catalog](https://commongrants.org/custom-fields/).** Shared concepts use unprefixed keys such as `agency`, `contactInfo`, `additionalInfo`, `eligibilityCriteria`, `attachments`, `fundingSource`, `fundingInstrument`, and `lastSyncedAt`. Compass-specific provenance and eligibility data stays `md*`-prefixed. Applicant eligibility also uses the native `acceptedApplicantTypes` field without inferring more-specific legal categories than Compass supplies.
 - **Auto-generated spec validated against the CommonGrants base protocol** via `cg check spec` from `@common-grants/cli`. Runs in CI.
 - **Auto-generated SQL types** via `kysely-codegen`. Never hand-edit `src/storage/sql/schema.ts`.
 - **No deep cross-directory imports.** Every `src/<dir>/` has an `index.ts` public surface. Lint-enforced.
 
-## Implementing the Maryland adapter
+## Maryland source behavior
 
-Everything outside `src/adapter/` is source-agnostic. The module names and seams
-are already in place, so building the Maryland adapter means replacing bodies,
-not restructuring:
-
-| File                | Reference implementation (CKAN)                             | What yours needs to do                                                                       |
-| ------------------- | ----------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| `mdSource.ts`       | Zod schema for a CKAN row + `datastore_search` envelope     | Zod schema for one raw source record + whatever list envelope the source returns             |
-| `MdSourceClient.ts` | Builds `datastore_search?resource_id=…` URLs                | Fetch + paginate your source; implement `ISourceClient`                                      |
-| `transform.ts`      | Maps CKAN columns (`PortalID`, `LastUpdated`, …)            | Map your source's fields onto the CG `Opportunity` (and back, for `fromCommon`)              |
-| `fields.ts`         | `MdStringListSchema` + mirrored catalog value schemas       | Keep the mirrored catalog schemas verbatim; adjust the source-specific ones                  |
-| `plugin.ts`         | Declares `md*`-prefixed custom fields                       | Re-describe the custom fields against your source's data                                     |
-| `index.ts`          | `getSourceId` → `PortalID`, `getModifiedAt` → `LastUpdated` | Point both at your source's equivalents — `getModifiedAt` must be lexicographically sortable |
-
-Two things to keep as they are:
-
-- The mirrored catalog value schemas in `fields.ts` (`AgencyValueSchema`,
-  `ContactInfoValueSchema`, `AdditionalInfoValueSchema`, `CostSharingValueSchema`)
-  are byte-identical across the sibling plugins (PA, CA, …) on purpose. Don't
-  drift them.
-- The unprefixed cross-source keys in `plugin.ts` (`fundingSource`,
-  `fundingInstrument`, `lastSyncedAt`).
-
-Then update the two `vars` in `wrangler.jsonc` (`MD_API_BASE_URL`,
-`MD_RESOURCE_ID`) to whatever shape the new client wants, and replace the
-fixtures + tests under `__tests__/adapter/`, which carry the reference source's
-records.
+- Base API: `https://compass.maryland.gov/api/v1/incentives/`
+- Stable source key: `slug`
+- Incremental watermark: detail-record `updated_at`
+- Included records: public, grant assistance, non-low data quality, and public-sector geographic scopes
+- Status: accepting programs are `open`; recurring programs are represented as `custom: Recurring`; all other programs preserve Compass's `custom: Confirm with agency` classification. Deadline dates remain available without being used to infer a stronger status than the source asserts.
+- Funding amounts are parsed only from explicit caps, floors, or ranges in `assistance_description`; the complete source text is always retained in `funding.details`
 
 ## Forking for a different source system
 

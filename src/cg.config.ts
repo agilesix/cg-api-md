@@ -73,7 +73,7 @@ export function buildConfig(env: Cloudflare.Env, logger: Logger = console): AppC
   const snapshots = new BucketSnapshotStore(env.SNAPSHOTS);
   const service = new OpportunityService(repo);
 
-  const client = new MdSourceClient(env.MD_API_BASE_URL, env.MD_RESOURCE_ID);
+  const client = new MdSourceClient(env.MD_API_BASE_URL);
 
   const sync = (options?: SyncOptions): Promise<SyncStats> =>
     runSync(
@@ -83,9 +83,10 @@ export function buildConfig(env: Cloudflare.Env, logger: Logger = console): AppC
         snapshots,
         logger,
         getSourceId,
-        // Enables incremental sync: the ETL reads the persisted watermark,
-        // fetches only the delta past it, and advances it after a clean run.
+        // Compass requires a full collection scan, but the watermark remains
+        // useful sync metadata and content hashes avoid unchanged writes.
         getModifiedAt,
+        reconcileMissing: true,
         toStored: (g: MdGrant, contentHash) => {
           // Validate via the plugin's `toCommon`. `definePlugin()` wraps it
           // with `commonSchema` validation, so any non-empty `errors` means the

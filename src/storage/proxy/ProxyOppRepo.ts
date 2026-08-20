@@ -97,6 +97,10 @@ export class ProxyOppRepo<TSource> implements IOppRepo {
     return new Map();
   }
 
+  async deleteBySourceIds(_sourceIds: string[]): Promise<void> {
+    // No-op: proxy tier has no persistence.
+  }
+
   async getLastSyncedAt(): Promise<string | null> {
     return this.cachedAt === 0 ? null : new Date(this.cachedAt).toISOString();
   }

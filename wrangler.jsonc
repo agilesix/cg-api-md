@@ -26,21 +26,13 @@
     },
   ],
   "triggers": {
-    // Sync every 8 hours. Inherited from the sibling state APIs; revisit once
-    // Maryland's actual refresh rate is known. Syncs are incremental
-    // (watermark-based), so each run only fetches the changed delta.
-    "crons": ["0 */8 * * *"],
+    // Compass exposes modification timestamps only on detail records, so each
+    // sync hydrates the complete filtered collection before applying its
+    // watermark. Run daily to keep upstream traffic proportionate.
+    "crons": ["0 8 * * *"],
   },
   "vars": {
-    // TODO(md-source): Maryland's upstream API has not been identified yet, so
-    // this base URL is an intentionally unresolvable RFC 2606 `.invalid` host —
-    // a live sync fails loudly rather than silently hitting the wrong service.
-    //
-    // `MdSourceClient` currently builds CKAN `datastore_search` requests against
-    // these two values (carried over from the template's reference adapter).
-    // Replace both the values and the request shape once the real source is known.
-    "MD_API_BASE_URL": "https://md-source.invalid/REPLACE-WITH-MD-SOURCE-API-BASE",
-    "MD_RESOURCE_ID": "funding",
+    "MD_API_BASE_URL": "https://compass.maryland.gov/api/v1",
     "ENVIRONMENT": "production",
   },
   "observability": {
@@ -68,8 +60,7 @@
         },
       ],
       "vars": {
-        "MD_API_BASE_URL": "https://md-source.invalid/REPLACE-WITH-MD-SOURCE-API-BASE",
-        "MD_RESOURCE_ID": "funding",
+        "MD_API_BASE_URL": "https://compass.maryland.gov/api/v1",
         "ENVIRONMENT": "preview",
       },
     },

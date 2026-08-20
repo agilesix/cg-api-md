@@ -1,104 +1,127 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { MdApiError, MdSourceClient } from '../../src/adapter';
 import { ca1Fixture } from './fixtures';
 
-const ACTION = 'https://data.example.gov/api/3/action';
-const RESOURCE = '111c8c88-21f6-453c-ae2c-b4785a0624f5';
+const BASE = 'https://compass.maryland.gov/api/v1';
+const summary = {
+  slug: ca1Fixture.slug,
+  program_name: ca1Fixture.program_name,
+  agency: ca1Fixture.agency,
+  URL: ca1Fixture.URL,
+  is_accepting_applications: true,
+  is_recurring: true,
+  data_quality: 'high',
+  funding_source: 'public',
+  geographic_scope: 'statewide',
+  assistance_type: ['grant'],
+  eligible_industries: [],
+  eligible_counties: ['All'],
+  eligible_incentive_areas: [],
+  eligible_organization_types: [],
+  application_deadline_string: '',
+  application_deadline_date: '',
+  program_description: '',
+};
 
-/** Build a CKAN `datastore_search` envelope Response. */
-function ckan(records: unknown[], init: ResponseInit = { status: 200 }): Response {
-  return new Response(JSON.stringify({ success: true, result: { records } }), init);
-}
+const json = (value: unknown, status = 200) =>
+  new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } });
 
 describe('MdSourceClient', () => {
   beforeEach(() => vi.stubGlobal('fetch', vi.fn()));
   afterEach(() => vi.restoreAllMocks());
 
-  describe('getGrant', () => {
-    it('fetches a single record by PortalID via a CKAN filter', async () => {
-      const mockFetch = vi.mocked(globalThis.fetch);
-      mockFetch.mockResolvedValueOnce(ckan([ca1Fixture]));
-
-      const client = new MdSourceClient(ACTION, RESOURCE);
-      const result = await client.getGrant('ca-178419');
-
-      expect(result?.PortalID).toBe('ca-178419');
-      const url = mockFetch.mock.calls[0]?.[0] as string;
-      expect(url).toContain('/datastore_search');
-      expect(url).toContain(`resource_id=${RESOURCE}`);
-      // filters={"PortalID":"ca-178419"} URL-encoded
-      expect(url).toContain(encodeURIComponent(JSON.stringify({ PortalID: 'ca-178419' })));
-      expect(url).toContain('limit=1');
-    });
-
-    it('returns null when the filter matches no records', async () => {
-      vi.mocked(globalThis.fetch).mockResolvedValueOnce(ckan([]));
-      const client = new MdSourceClient(ACTION, RESOURCE);
-      expect(await client.getGrant('missing')).toBeNull();
-    });
-
-    it('throws MdApiError on a non-success response', async () => {
-      vi.mocked(globalThis.fetch).mockResolvedValueOnce(new Response('boom', { status: 500 }));
-      const client = new MdSourceClient(ACTION, RESOURCE);
-      await expect(client.getGrant('ca-178419')).rejects.toBeInstanceOf(MdApiError);
-    });
-
-    it('throws MdApiError when the body reports success: false', async () => {
-      vi.mocked(globalThis.fetch).mockResolvedValueOnce(
-        new Response(JSON.stringify({ success: false, result: { records: [] } }), { status: 200 }),
-      );
-      const client = new MdSourceClient(ACTION, RESOURCE);
-      await expect(client.getGrant('ca-178419')).rejects.toBeInstanceOf(MdApiError);
-    });
-
-    it('normalizes trailing slashes on the base URL', async () => {
-      const mockFetch = vi.mocked(globalThis.fetch);
-      mockFetch.mockResolvedValueOnce(ckan([ca1Fixture]));
-      const client = new MdSourceClient(`${ACTION}///`, RESOURCE);
-      await client.getGrant('ca-178419');
-      const url = mockFetch.mock.calls[0]?.[0] as string;
-      expect(url.startsWith(`${ACTION}/datastore_search`)).toBe(true);
-    });
+  it('gets a qualifying grant by its encoded slug', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(json(ca1Fixture));
+    const result = await new MdSourceClient(BASE).getGrant(ca1Fixture.slug);
+    expect(result?.id).toBe(1046);
+    expect(String(vi.mocked(fetch).mock.calls[0]?.[0])).toContain(
+      `/incentives/${ca1Fixture.slug}/`,
+    );
   });
 
-  describe('listAll', () => {
-    it('yields every record from a single (short) page', async () => {
-      vi.mocked(globalThis.fetch).mockResolvedValueOnce(
-        ckan([ca1Fixture, { ...ca1Fixture, PortalID: 'ca-2' }]),
+  it('normalizes nullable Compass metadata', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(
+      json({ ...ca1Fixture, is_recurring: null, source_count: null }),
+    );
+    const result = await new MdSourceClient(BASE).getGrant(ca1Fixture.slug);
+    expect(result).toMatchObject({ is_recurring: false, source_count: 0 });
+  });
+
+  it('returns null for 404 and excluded private or low-quality records', async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(new Response('', { status: 404 }))
+      .mockResolvedValueOnce(json({ ...ca1Fixture, funding_source: 'private' }))
+      .mockResolvedValueOnce(json({ ...ca1Fixture, data_quality: 'low' }));
+    const client = new MdSourceClient(BASE);
+    await expect(client.getGrant('missing')).resolves.toBeNull();
+    await expect(client.getGrant('private')).resolves.toBeNull();
+    await expect(client.getGrant('low-quality')).resolves.toBeNull();
+  });
+
+  it('hydrates the full list for reconciliation and follows pagination', async () => {
+    const page2 = `${BASE}/incentives/?page=2`;
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(json({ count: 2, next: page2, previous: null, results: [summary] }))
+      .mockResolvedValueOnce(json(ca1Fixture))
+      .mockResolvedValueOnce(
+        json({ count: 2, next: null, previous: BASE, results: [{ ...summary, slug: 'older' }] }),
+      )
+      .mockResolvedValueOnce(
+        json({ ...ca1Fixture, id: 2, slug: 'older', updated_at: '2026-01-01T00:00:00Z' }),
       );
 
-      const client = new MdSourceClient(ACTION, RESOURCE);
-      const collected = [];
-      for await (const g of client.listAll()) collected.push(g);
+    const grants = [];
+    for await (const grant of new MdSourceClient(BASE).listAll({ since: '2026-08-01T00:00:00Z' })) {
+      grants.push(grant.slug);
+    }
+    expect(grants).toEqual([ca1Fixture.slug, 'older']);
+    const firstUrl = String(vi.mocked(fetch).mock.calls[0]?.[0]);
+    expect(firstUrl).toContain('assistance=grant');
+    expect(firstUrl).toContain('scope=State');
+    expect(firstUrl).toContain('scope=Regional');
+  });
 
-      expect(collected.map((g) => g.PortalID)).toEqual(['ca-178419', 'ca-2']);
-      // sort=LastUpdated desc is requested
-      const url = vi.mocked(globalThis.fetch).mock.calls[0]?.[0] as string;
-      expect(url).toContain(`sort=${encodeURIComponent('LastUpdated desc')}`);
+  it('rejects a truncated successful pagination sequence', async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(json({ count: 2, next: null, previous: null, results: [summary] }))
+      .mockResolvedValueOnce(json(ca1Fixture));
+
+    const consume = async () => {
+      for await (const _grant of new MdSourceClient(BASE).listAll()) {
+        // Consume the complete generator so its reconciliation guard runs.
+      }
+    };
+    await expect(consume()).rejects.toThrow('received 1 of 2 summaries');
+  });
+
+  it('retries a transient rate-limit response', async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(
+        new Response('slow down', { status: 429, headers: { 'retry-after': '0' } }),
+      )
+      .mockResolvedValueOnce(json(ca1Fixture));
+
+    await expect(new MdSourceClient(BASE).getGrant(ca1Fixture.slug)).resolves.toMatchObject({
+      slug: ca1Fixture.slug,
     });
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
+  });
 
-    it('early-stops at the `since` watermark (records are newest-first)', async () => {
-      // Server returns newest-first; the watermark is the middle record.
-      vi.mocked(globalThis.fetch).mockResolvedValueOnce(
-        ckan([
-          { ...ca1Fixture, PortalID: 'newer', LastUpdated: '2026-06-22 17:23:55' },
-          { ...ca1Fixture, PortalID: 'boundary', LastUpdated: '2026-06-20 10:00:00' },
-          { ...ca1Fixture, PortalID: 'older', LastUpdated: '2026-06-01 08:00:00' },
-        ]),
-      );
+  it('retries a transient server error', async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(
+        new Response('unavailable', { status: 503, headers: { 'retry-after': '0' } }),
+      )
+      .mockResolvedValueOnce(json(ca1Fixture));
 
-      const client = new MdSourceClient(ACTION, RESOURCE);
-      const collected = [];
-      for await (const g of client.listAll({ since: '2026-06-20 10:00:00' })) collected.push(g);
-
-      // `>=` boundary: 'newer' and 'boundary' are yielded; 'older' stops the scan.
-      expect(collected.map((g) => g.PortalID)).toEqual(['newer', 'boundary']);
+    await expect(new MdSourceClient(BASE).getGrant(ca1Fixture.slug)).resolves.toMatchObject({
+      slug: ca1Fixture.slug,
     });
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
+  });
 
-    it('throws MdApiError on a non-success response', async () => {
-      vi.mocked(globalThis.fetch).mockResolvedValueOnce(new Response('boom', { status: 503 }));
-      const client = new MdSourceClient(ACTION, RESOURCE);
-      await expect(client.listAll().next()).rejects.toBeInstanceOf(MdApiError);
-    });
+  it('throws a typed error for upstream failures', async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response('boom', { status: 400 }));
+    await expect(new MdSourceClient(BASE).getGrant('x')).rejects.toBeInstanceOf(MdApiError);
   });
 });

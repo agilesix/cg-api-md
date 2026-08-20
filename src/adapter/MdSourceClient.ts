@@ -1,118 +1,165 @@
 import type { ISourceClient } from '../core';
-import { CkanDatastoreResponseSchema, type MdGrant } from './mdSource';
+import { MdGrantListResponseSchema, MdGrantSchema, type MdGrant } from './mdSource';
 
-/**
- * Typed error thrown by `MdSourceClient` when the upstream CKAN DataStore
- * returns a non-OK status or an unsuccessful body. Exposes both the HTTP
- * status and the raw response body so callers can distinguish transient
- * (server-error) from permanent (client-error) failures.
- */
 export class MdApiError extends Error {
-  readonly status: number;
-  readonly body: string;
-
-  constructor(status: number, body: string) {
-    super(`MD API returned ${status}: ${body.slice(0, 200)}`);
+  constructor(
+    readonly status: number,
+    readonly body: string,
+  ) {
+    super(`Maryland Compass API returned ${status}: ${body.slice(0, 200)}`);
     this.name = 'MdApiError';
-    this.status = status;
-    this.body = body;
   }
 }
 
-/**
- * Number of records requested per page. CKAN caps the effective `limit` at
- * 50,000 (it silently clamps larger values), and the full dataset is ~1,942
- * rows, so any page size ≥ the dataset would work in one request. We page in
- * chunks of 1,000 anyway so a future dataset growth, or a slow-changing
- * incremental scan, stays bounded per request.
- */
-const PAGE_SIZE = 1000;
+export class MdPaginationError extends Error {
+  constructor(message: string) {
+    super(`Maryland Compass pagination was incomplete: ${message}`);
+    this.name = 'MdPaginationError';
+  }
+}
 
-/**
- * HTTP client for the Maryland Grants Portal, published as a CKAN DataStore
- * resource on `data.example.gov`.
- *
- * The upstream shape (as of 2026-06):
- *
- *   - `GET /datastore_search?resource_id=…` returns
- *     `{ success, result: { records: MdGrant[], total, _links } }`.
- *   - `limit` + `offset` paginate; `sort=LastUpdated desc` orders newest-first.
- *   - `filters={"PortalID":"…"}` fetches a single record by its portal id.
- *   - No auth, no rate limiting observed.
- *
- * Implements {@link ISourceClient} so the ETL and the proxy repository can
- * consume it without knowing it's MD-specific.
- *
- * **Incremental scans.** `listAll({ since })` orders records newest-first and
- * stops as soon as it crosses the `since` watermark — so a steady-state sync
- * (≈ tens of changed rows) returns in a single page instead of re-streaming
- * the whole dataset. `since` is compared against MD's raw `LastUpdated`
- * string, which is lexicographically sortable (`"YYYY-MM-DD HH:MM:SS"`).
- */
+const PUBLIC_SCOPES = ['State', 'County', 'Local', 'Regional'] as const;
+const DETAIL_CONCURRENCY = 5;
+const MAX_ATTEMPTS = 4;
+const REQUEST_TIMEOUT_MS = 10_000;
+const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
+
+/** Read-only client for Maryland Community Compass's incentives REST API. */
 export class MdSourceClient implements ISourceClient<MdGrant> {
-  private readonly actionUrl: string;
-  private readonly resourceId: string;
+  private readonly collectionUrl: string;
 
-  /**
-   * @param baseUrl    CKAN action API base, e.g. `https://data.example.gov/api/3/action`.
-   * @param resourceId The DataStore resource id for the grants table.
-   */
-  constructor(baseUrl: string, resourceId: string) {
-    // Normalize to no trailing slash so we can uniformly append `/datastore_search`.
-    this.actionUrl = baseUrl.replace(/\/+$/, '');
-    this.resourceId = resourceId;
+  constructor(baseUrl: string) {
+    const normalized = baseUrl.replace(/\/+$/, '');
+    this.collectionUrl = normalized.endsWith('/incentives')
+      ? `${normalized}/`
+      : `${normalized}/incentives/`;
   }
 
-  async getGrant(portalId: string): Promise<MdGrant | null> {
-    const filters = encodeURIComponent(JSON.stringify({ PortalID: portalId }));
-    const url =
-      `${this.actionUrl}/datastore_search?resource_id=${encodeURIComponent(this.resourceId)}` +
-      `&filters=${filters}&limit=1`;
-    const body = await this.fetchPage(url);
-    return body.result.records[0] ?? null;
+  async getGrant(slug: string): Promise<MdGrant | null> {
+    const url = new URL(`${encodeURIComponent(slug)}/`, this.collectionUrl);
+    const response = await this.fetchWithRetry(url);
+    if (response.status === 404) return null;
+    if (!response.ok) throw new MdApiError(response.status, await response.text());
+    const grant = MdGrantSchema.parse((await response.json()) as unknown);
+    return isIncludedGrant(grant) ? grant : null;
   }
 
-  /**
-   * Iterate every record, newest-first. When `since` is provided, stop as soon
-   * as a record older than the watermark is reached (the `>=` boundary is
-   * intentional — a record whose `LastUpdated` equals the watermark is
-   * re-yielded so a same-second update on a later run isn't missed; the ETL's
-   * content-hash short-circuit makes the re-yield a cheap no-op).
-   */
+  /** Compass exposes timestamps only on details, so each summary is hydrated. */
   async *listAll(opts: { since?: string | null } = {}): AsyncGenerator<MdGrant> {
-    const since = opts.since ?? null;
-    let offset = 0;
-
-    for (;;) {
-      const url =
-        `${this.actionUrl}/datastore_search?resource_id=${encodeURIComponent(this.resourceId)}` +
-        `&limit=${PAGE_SIZE}&offset=${offset}&sort=${encodeURIComponent('LastUpdated desc')}`;
-      const body = await this.fetchPage(url);
-      const records = body.result.records;
-      if (records.length === 0) return;
-
-      for (const rec of records) {
-        // Records are newest-first: once we drop below the watermark, every
-        // remaining record (this page and all later pages) is older too.
-        if (since !== null && rec.LastUpdated < since) return;
-        yield rec;
+    // Compass has no collection-level updated-since filter and reconciliation
+    // requires the complete qualifying source-id set. Detail records are
+    // therefore yielded in full; the ETL content hashes unchanged rows.
+    void opts;
+    let next: string | null = this.buildFirstPageUrl();
+    let expectedCount: number | null = null;
+    let summariesSeen = 0;
+    const seenSlugs = new Set<string>();
+    while (next) {
+      const page = await this.fetchList(next);
+      if (expectedCount === null) expectedCount = page.count;
+      if (page.count !== expectedCount) {
+        throw new MdPaginationError(
+          `advertised count changed from ${expectedCount} to ${page.count}`,
+        );
       }
-
-      // A short page means we've reached the end of the dataset.
-      if (records.length < PAGE_SIZE) return;
-      offset += PAGE_SIZE;
+      summariesSeen += page.results.length;
+      for (const summary of page.results) {
+        if (seenSlugs.has(summary.slug)) {
+          throw new MdPaginationError(`duplicate slug ${summary.slug}`);
+        }
+        seenSlugs.add(summary.slug);
+      }
+      const details = await mapWithConcurrency(page.results, DETAIL_CONCURRENCY, (summary) =>
+        this.getGrant(summary.slug),
+      );
+      for (const grant of details) {
+        if (!grant) continue;
+        // Compass does not sort the collection by updated_at, so a delta sync
+        // must scan every page and filter only after detail hydration.
+        yield grant;
+      }
+      next = page.next;
+      if (next === null && summariesSeen !== expectedCount) {
+        throw new MdPaginationError(`received ${summariesSeen} of ${expectedCount} summaries`);
+      }
     }
   }
 
-  /** Fetch + validate a single CKAN page. Throws {@link MdApiError} on failure. */
-  private async fetchPage(url: string): Promise<CkanDatastoreResponse> {
-    const res = await fetch(url, { headers: { accept: 'application/json' } });
-    if (!res.ok) throw new MdApiError(res.status, await res.text());
-    const json = (await res.json()) as unknown;
-    const body = CkanDatastoreResponseSchema.parse(json);
-    if (!body.success) throw new MdApiError(res.status, JSON.stringify(json).slice(0, 500));
-    return body;
+  private buildFirstPageUrl(): string {
+    const url = new URL(this.collectionUrl);
+    url.searchParams.append('assistance', 'grant');
+    for (const scope of PUBLIC_SCOPES) url.searchParams.append('scope', scope);
+    return url.toString();
+  }
+
+  private async fetchList(url: string) {
+    const response = await this.fetchWithRetry(url);
+    if (!response.ok) throw new MdApiError(response.status, await response.text());
+    return MdGrantListResponseSchema.parse((await response.json()) as unknown);
+  }
+
+  private async fetchWithRetry(url: string | URL): Promise<Response> {
+    let lastError: unknown = null;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+      try {
+        const response = await fetch(url, {
+          headers: { accept: 'application/json' },
+          signal: controller.signal,
+        });
+        if (!RETRYABLE_STATUSES.has(response.status) || attempt === MAX_ATTEMPTS) {
+          return response;
+        }
+        await response.body?.cancel();
+        await delay(retryDelayMs(response, attempt));
+      } catch (error) {
+        lastError = error;
+        if (attempt === MAX_ATTEMPTS) throw error;
+        await delay(250 * 2 ** (attempt - 1));
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error('Maryland Compass request failed');
   }
 }
 
-type CkanDatastoreResponse = ReturnType<typeof CkanDatastoreResponseSchema.parse>;
+export function isIncludedGrant(grant: MdGrant): boolean {
+  const quality = grant.data_quality.toLowerCase();
+  return (
+    grant.funding_source.toLowerCase() === 'public' &&
+    (quality === 'medium' || quality === 'high') &&
+    grant.assistance_type.some((type) => type.toLowerCase() === 'grant')
+  );
+}
+
+async function mapWithConcurrency<T, R>(
+  values: T[],
+  concurrency: number,
+  mapper: (value: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(values.length);
+  let cursor = 0;
+  const worker = async () => {
+    for (;;) {
+      const index = cursor++;
+      if (index >= values.length) return;
+      results[index] = await mapper(values[index] as T);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, values.length) }, worker));
+  return results;
+}
+
+function retryDelayMs(response: Response, attempt: number): number {
+  const retryAfter = response.headers.get('retry-after');
+  if (retryAfter && /^\d+$/.test(retryAfter)) {
+    return Math.min(Number(retryAfter) * 1_000, 5_000);
+  }
+  return 250 * 2 ** (attempt - 1);
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}

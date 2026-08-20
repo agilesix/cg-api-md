@@ -5,7 +5,7 @@
 --
 -- Conventions:
 --   - `id` is the CommonGrants UUID v5 derived from the source identifier.
---   - `source_id` is the raw MD PortalID; UNIQUE so the ETL can use it as the
+--   - `source_id` is the raw MD Compass slug; UNIQUE so the ETL can use it as the
 --     upsert lookup key.
 --   - Financial amounts stored as integer cents to avoid float drift.
 --   - `raw_json` holds the fully-serialized CommonGrants Opportunity so the
@@ -46,7 +46,7 @@ CREATE TABLE sync_log (
 );
 
 -- Single-row table holding the incremental-sync high-watermark: the maximum
--- source `LastUpdated` value ingested so far. The ETL passes it to the source
+-- source `updated_at` value ingested so far. The ETL passes it to the source
 -- client so a steady-state sync fetches only the changed delta instead of
 -- re-streaming the whole dataset. The CHECK pins it to exactly one row.
 CREATE TABLE sync_state (

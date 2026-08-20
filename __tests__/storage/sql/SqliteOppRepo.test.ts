@@ -274,6 +274,27 @@ describe('SqliteOppRepo', () => {
     });
   });
 
+  describe('deleteBySourceIds', () => {
+    it('removes only the requested source records', async () => {
+      const repo = buildRepo();
+      await repo.upsertBatch([
+        fakeRow({
+          id: '00000000-0000-5000-8000-000000000001',
+          sourceId: 'keep',
+        }),
+        fakeRow({
+          id: '00000000-0000-5000-8000-000000000002',
+          sourceId: 'remove',
+        }),
+      ]);
+
+      await repo.deleteBySourceIds(['remove']);
+
+      expect(await repo.findBySourceId('keep')).not.toBeNull();
+      expect(await repo.findBySourceId('remove')).toBeNull();
+    });
+  });
+
   describe('sync_log', () => {
     it('records a run start and completion', async () => {
       const repo = buildRepo();

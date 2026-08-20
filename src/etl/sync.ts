@@ -47,14 +47,14 @@ export interface SyncDeps<TSource> {
   /**
    * Extract the source identifier from a raw record. Needed here because
    * `SyncDeps` is generic over `TSource`; only the adapter knows which
-   * field is the natural identifier (MD's `PortalID`, grants.gov's
+   * field is the natural identifier (MD Compass's `slug`, grants.gov's
    * `opportunityNumber`, etc.).
    */
   getSourceId: (source: TSource) => string;
 
   /**
    * Optional incremental-sync hook: extract the source's last-modified marker
-   * (e.g. MD's `LastUpdated` string). When provided, a non-forced run reads the
+   * (e.g. MD Compass's `updated_at` string). When provided, a non-forced run reads the
    * persisted high-watermark, asks the client for only records modified since
    * then via `listAll({ since })`, and advances the watermark to the max marker
    * seen. Omit it for sources without a reliable per-record modified field —
@@ -62,6 +62,12 @@ export interface SyncDeps<TSource> {
    * ordered** (MD's `"YYYY-MM-DD HH:MM:SS"` qualifies).
    */
   getModifiedAt?: (source: TSource) => string;
+
+  /**
+   * Delete persisted rows not present in a successful full source scan.
+   * Enable only when `listAll()` always yields the complete qualifying set.
+   */
+  reconcileMissing?: boolean;
 }
 
 /** Optional knobs for a single `runSync` invocation. */
@@ -70,7 +76,7 @@ export interface SyncOptions {
    * When true, skip the contentHash short-circuit so every upstream record
    * is re-transformed and re-upserted even if its content hasn't changed.
    * Use this to repair bad rows after a transform-layer fix lands — the
-   * cron / lazy-resync paths leave this `false` so steady-state syncs stay
+   * cron paths leave this `false` so steady-state syncs stay
    * cheap.
    */
   force?: boolean;
@@ -119,12 +125,14 @@ export async function runSync<TSource>(
 
   try {
     const existingHashes = await deps.repo.allHashesBySourceId();
+    const seenSourceIds = new Set<string>();
     const toUpsert: StoredOpportunity[] = [];
     const toSnapshot: Array<{ key: string; body: string }> = [];
 
     for await (const source of deps.client.listAll({ since })) {
       recordsFetched += 1;
       const sourceId = deps.getSourceId(source);
+      seenSourceIds.add(sourceId);
 
       // Advance the watermark for every fetched record (even hash-skipped
       // ones): the boundary record re-fetched at `since` keeps it stable,
@@ -160,7 +168,16 @@ export async function runSync<TSource>(
       else recordsInserted += 1;
     }
 
+    if (deps.reconcileMissing && recordsFetched === 0 && existingHashes.size > 0) {
+      throw new Error('Refusing to reconcile an empty source scan against existing records');
+    }
+
+    const missingSourceIds = deps.reconcileMissing
+      ? [...existingHashes.keys()].filter((sourceId) => !seenSourceIds.has(sourceId))
+      : [];
+
     await Promise.all([deps.repo.upsertBatch(toUpsert), deps.snapshots.putMany(toSnapshot)]);
+    await deps.repo.deleteBySourceIds(missingSourceIds);
 
     // Persist the advanced watermark only after a successful write, so a failed
     // run is retried from the previous watermark next time (idempotent via the
@@ -170,7 +187,7 @@ export async function runSync<TSource>(
     }
 
     logger.info(
-      `[sync] complete${force ? ' (forced)' : ''}: fetched=${recordsFetched} inserted=${recordsInserted} updated=${recordsUpdated} skipped=${recordsSkipped}`,
+      `[sync] complete${force ? ' (forced)' : ''}: fetched=${recordsFetched} inserted=${recordsInserted} updated=${recordsUpdated} skipped=${recordsSkipped} removed=${missingSourceIds.length}`,
     );
   } catch (err) {
     errorMessage = err instanceof Error ? err.message : String(err);

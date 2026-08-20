@@ -56,6 +56,9 @@ export interface IOppRepo {
    */
   allHashesBySourceId(): Promise<Map<string, string>>;
 
+  /** Delete persisted opportunities by their source-system identifiers. */
+  deleteBySourceIds(sourceIds: string[]): Promise<void>;
+
   /**
    * ISO datetime of the most recent successful sync, or `null` if none has
    * run yet. Drives the `X-Data-As-Of` response header.

@@ -52,6 +52,11 @@ class FakeRepo implements IOppRepo {
   async allHashesBySourceId() {
     return new Map([...this.rows.values()].map((r) => [r.sourceId, r.contentHash]));
   }
+  async deleteBySourceIds(sourceIds: string[]) {
+    for (const [id, row] of this.rows) {
+      if (sourceIds.includes(row.sourceId)) this.rows.delete(id);
+    }
+  }
   async getLastSyncedAt() {
     return this.lastSync;
   }
@@ -144,7 +149,7 @@ describe('GET /common-grants/opportunities/:id', () => {
     };
     expect(body.status).toBe(200);
     expect(body.data.id).toBe(row.id);
-    expect(body.data.title).toBe('Wood Products Innovation Grant');
+    expect(body.data.title).toBe('Build Our Future Grant Program');
   });
 
   it('returns 404 when not found', async () => {
